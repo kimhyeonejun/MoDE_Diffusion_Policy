@@ -11,7 +11,6 @@ import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_info, rank_zero_only
 import einops 
 import wandb
-# get defaultdict from collections module
 
 from torchmetrics import MeanMetric
 from mode.models.edm_diffusion.gc_sampling import *
@@ -126,8 +125,6 @@ class MoDEAgent(pl.LightningModule):
         self.frozen_expert_mask = None
 
         if self.start_from_pretrained and ckpt_path is not None:
-            # self.analyze_resnet_architecture(ckpt_path)
-            # self.analyze_state_dict_keys(ckpt_path)
             self.load_pretrained_parameters(ckpt_path)
 
         self.need_precompute_experts_for_inference = False
@@ -266,215 +263,6 @@ class MoDEAgent(pl.LightningModule):
             
         except Exception as e:
             raise RuntimeError(f"Failed to load weights from {ckpt_path}: {str(e)}")
-
-    def analyze_resnet_architecture(self, ckpt_path):
-        """
-        Analyze ResNet architecture from checkpoint and compare with current model.
-        """
-        print("Analyzing ResNet architectures...")
-        
-        try:
-            # Load checkpoint
-            if os.path.isdir(ckpt_path):
-                cleaned_safetensors = os.path.join(ckpt_path, "model_cleaned.safetensors")
-                cleaned_pytorch = os.path.join(ckpt_path, "model_cleaned.pt")
-                
-                if os.path.exists(cleaned_safetensors):
-                    from safetensors.torch import load_file
-                    state_dict = load_file(cleaned_safetensors)
-                elif os.path.exists(cleaned_pytorch):
-                    state_dict = torch.load(cleaned_pytorch)['state_dict']
-                else:
-                    raise FileNotFoundError(f"No cleaned weights found in {ckpt_path}")
-            else:
-                checkpoint_data = torch.load(ckpt_path)
-                state_dict = checkpoint_data.get('state_dict', checkpoint_data)
-                
-            current_state = self.state_dict()
-            
-            # Key layers to check for ResNet identification
-            key_layers = {
-                'conv1': {'prefix': 'gripper_resnet.resnet.conv1.weight'},
-                'layer1': {'prefix': 'gripper_resnet.resnet.layer1.0'},
-                'layer2': {'prefix': 'gripper_resnet.resnet.layer2.0'},
-                'layer3': {'prefix': 'gripper_resnet.resnet.layer3.0'},
-                'layer4': {'prefix': 'gripper_resnet.resnet.layer4.0'}
-            }
-            
-            print("\nCheckpoint ResNet Analysis:")
-            print("=" * 50)
-            
-            # Analyze checkpoint architecture
-            checkpoint_architecture = {}
-            for layer_name, layer_info in key_layers.items():
-                base_prefix = layer_info['prefix']
-                relevant_keys = [k for k in state_dict.keys() if k.startswith(base_prefix)]
-                
-                if relevant_keys:
-                    print(f"\n{layer_name} analysis:")
-                    for key in relevant_keys:
-                        if 'weight' in key:
-                            shape = state_dict[key].shape
-                            checkpoint_architecture[key] = shape
-                            print(f"  {key}: {shape}")
-            
-            print("\nCurrent Model ResNet Analysis:")
-            print("=" * 50)
-            
-            # Analyze current model architecture
-            current_architecture = {}
-            for layer_name, layer_info in key_layers.items():
-                base_prefix = layer_info['prefix']
-                relevant_keys = [k for k in current_state.keys() if k.startswith(base_prefix)]
-                
-                if relevant_keys:
-                    print(f"\n{layer_name} analysis:")
-                    for key in relevant_keys:
-                        if 'weight' in key:
-                            shape = current_state[key].shape
-                            current_architecture[key] = shape
-                            print(f"  {key}: {shape}")
-            
-            # Compare architectures
-            print("\nArchitecture Comparison:")
-            print("=" * 50)
-            all_keys = set(checkpoint_architecture.keys()) | set(current_architecture.keys())
-            
-            for key in sorted(all_keys):
-                checkpoint_shape = checkpoint_architecture.get(key, "Not present")
-                current_shape = current_architecture.get(key, "Not present")
-                if checkpoint_shape != current_shape:
-                    print(f"\n{key}:")
-                    print(f"  Checkpoint: {checkpoint_shape}")
-                    print(f"  Current: {current_shape}")
-            
-            # Try to identify ResNet variants
-            def identify_resnet_variant(architecture):
-                # Common ResNet variants and their layer4 output channels
-                variants = {
-                    2048: "ResNet50/101/152",
-                    512: "ResNet18/34",
-                    1024: "ResNet26/38"
-                }
-                
-                # Look for layer4 output channels
-                for key, shape in architecture.items():
-                    if 'layer4' in key and 'conv3' in key:
-                        output_channels = shape[0] if len(shape) == 4 else shape[-1]
-                        return variants.get(output_channels, "Unknown variant")
-                return "Could not determine variant"
-            
-            print("\nResNet Variant Analysis:")
-            print("=" * 50)
-            print(f"Checkpoint appears to be: {identify_resnet_variant(checkpoint_architecture)}")
-            print(f"Current model appears to be: {identify_resnet_variant(current_architecture)}")
-            
-            # Analyze FiLM layers
-            print("\nFiLM Layer Analysis:")
-            print("=" * 50)
-            film_keys = [k for k in state_dict.keys() if 'film' in k.lower()]
-            if film_keys:
-                print("\nCheckpoint FiLM layers:")
-                for key in sorted(film_keys):
-                    if key in state_dict:
-                        print(f"  {key}: {state_dict[key].shape}")
-            
-            current_film_keys = [k for k in current_state.keys() if 'film' in k.lower()]
-            if current_film_keys:
-                print("\nCurrent model FiLM layers:")
-                for key in sorted(current_film_keys):
-                    if key in current_state:
-                        print(f"  {key}: {current_state[key].shape}")
-                        
-        except Exception as e:
-            print(f"Analysis failed: {str(e)}")
-            raise
-
-    def analyze_state_dict_keys(self, ckpt_path):
-        """
-        Analyze and compare state dict keys between checkpoint and current model.
-        """
-        print("Analyzing state dict keys...")
-        
-        try:
-            # Load checkpoint
-            if os.path.isdir(ckpt_path):
-                cleaned_safetensors = os.path.join(ckpt_path, "model_cleaned.safetensors")
-                cleaned_pytorch = os.path.join(ckpt_path, "model_cleaned.pt")
-                
-                if os.path.exists(cleaned_safetensors):
-                    from safetensors.torch import load_file
-                    checkpoint_dict = load_file(cleaned_safetensors)
-                    print("Loading from safetensors file")
-                elif os.path.exists(cleaned_pytorch):
-                    checkpoint_dict = torch.load(cleaned_pytorch)['state_dict']
-                    print("Loading from PyTorch file")
-            else:
-                checkpoint_data = torch.load(ckpt_path)
-                if ('callbacks' in checkpoint_data and 
-                    'EMA' in checkpoint_data['callbacks'] and 
-                    'ema_weights' in checkpoint_data['callbacks']['EMA']):
-                    print("Found EMA weights")
-                    ema_weights_list = checkpoint_data['callbacks']['EMA']['ema_weights']
-                    checkpoint_dict = {
-                        name: ema_weights_list[i] 
-                        for i, (name, _) in enumerate(self.named_parameters())
-                    }
-                else:
-                    checkpoint_dict = checkpoint_data['state_dict']
-            
-            current_dict = self.state_dict()
-            
-            # Get sets of keys
-            checkpoint_keys = set(checkpoint_dict.keys())
-            current_keys = set(current_dict.keys())
-            
-            # Analyze differences
-            only_in_checkpoint = checkpoint_keys - current_keys
-            only_in_current = current_keys - checkpoint_keys
-            common_keys = checkpoint_keys & current_keys
-            
-            print("\nKey Analysis:")
-            print("=" * 50)
-            print(f"Total keys in checkpoint: {len(checkpoint_keys)}")
-            print(f"Total keys in current model: {len(current_keys)}")
-            print(f"Common keys: {len(common_keys)}")
-            
-            def print_key_group(keys, title):
-                if keys:
-                    print(f"\n{title} ({len(keys)}):")
-                    for key in sorted(keys)[:10]:
-                        if key in checkpoint_dict:
-                            shape_info = f" - Shape: {checkpoint_dict[key].shape}"
-                        elif key in current_dict:
-                            shape_info = f" - Shape: {current_dict[key].shape}"
-                        else:
-                            shape_info = ""
-                        print(f"  {key}{shape_info}")
-                    if len(keys) > 10:
-                        print(f"  ... and {len(keys)-10} more")
-            
-            print_key_group(only_in_checkpoint, "Keys only in checkpoint")
-            print_key_group(only_in_current, "Keys only in current model")
-            
-            # Check for any shape mismatches in common keys
-            shape_mismatches = []
-            for key in common_keys:
-                checkpoint_shape = checkpoint_dict[key].shape
-                current_shape = current_dict[key].shape
-                if checkpoint_shape != current_shape:
-                    shape_mismatches.append((key, checkpoint_shape, current_shape))
-            
-            if shape_mismatches:
-                print("\nShape mismatches in common keys:")
-                for key, checkpoint_shape, current_shape in shape_mismatches:
-                    print(f"\n{key}:")
-                    print(f"  Checkpoint: {checkpoint_shape}")
-                    print(f"  Current: {current_shape}")
-                    
-        except Exception as e:
-            print(f"Analysis failed: {str(e)}")
-            raise
 
     def configure_optimizers(self):
         """
@@ -655,10 +443,6 @@ class MoDEAgent(pl.LightningModule):
     def validation_step(self, batch: Dict[str, Dict], batch_idx: int) -> None:  # Change return type to None
         output = {}
         dataset_batch = batch
-        # for self.modality_scope, dataset_batch in batch.items():
-        # print('----------------------')
-        # print("Modality scope:", self.modality_scope)
-        # print("Dataset batch keys:", dataset_batch.keys())
         perceptual_emb, latent_goal = self.compute_input_embeddings(dataset_batch)
         
         action_pred = self.denoise_actions(
