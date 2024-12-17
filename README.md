@@ -88,6 +88,18 @@ Run this command to see more detailed information:
 python preprocess/extract_by_key.py -h
 ```
 
+
+Important params:
+* `--in_root`: `/YOUR/PATH/TO/CALVIN/`, e.g `/data3/geyuan/datasets/CALVIN/`
+* `--extract_key`: A key of `dict(episode_xxx.npz)`, default is **'rel_actions'**, the saved file name depends on this (i.e `ep_{extract_key}.npy`)
+Optional params:
+* `--in_task`: default is **'all'**, meaning all task folders (e.g `task_ABCD_D/`) of CALVIN
+* `--in_split`: default is **'all'**, meaning both `training/` and `validation/`
+* `--out_dir`: optional, default is **'None'**, and will be converted to `{in_root}/{in_task}/{in_split}/extracted/`
+* `--force`: whether to overwrite existing extracted data
+Thanks to @ygtxr1997 for debugging the GPU utilization and providing a merge request.
+
+
 ## Evaluation
 
 Download the pretrained models from Hugging Face: 
@@ -136,17 +148,6 @@ We used the following split for training:
 | **Total** | 1.000000 |
 
 The model was pretrained for 300k steps with full pretraining details provided here; [MoDE Pretraining Report](https://api.wandb.ai/links/irl-masterthesis/ql9m7m5i).
-
-Important params:
-* `--in_root`: `/YOUR/PATH/TO/CALVIN/`, e.g `/data3/geyuan/datasets/CALVIN/`
-* `--extract_key`: A key of `dict(episode_xxx.npz)`, default is **'rel_actions'**, the saved file name depends on this (i.e `ep_{extract_key}.npy`)
-Optional params:
-* `--in_task`: default is **'all'**, meaning all task folders (e.g `task_ABCD_D/`) of CALVIN
-* `--in_split`: default is **'all'**, meaning both `training/` and `validation/`
-* `--out_dir`: optional, default is **'None'**, and will be converted to `{in_root}/{in_task}/{in_split}/extracted/`
-* `--force`: whether to overwrite existing extracted data
-Thanks to @ygtxr1997 for debugging the GPU utilization and providing a merge request.
-
 
 ---
 
