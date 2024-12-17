@@ -1,7 +1,7 @@
 defaults:
   - callbacks: calvin
   - datamodule: calvin
-  - model: mode_agent # paliflow_agent # smolflow_agent # vlm_berg_agent
+  - model: mode_agent
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
 
@@ -15,7 +15,7 @@ log_dir: ./logs
 slurm: false
 seed: 242
 device: 'cuda'
-batch_size: 2 # 38 # 128
+batch_size: 64 # 38 # 128
 devices: 4
 act_dim: 7
 proprio_dims: 7
@@ -26,7 +26,7 @@ act_seq_len: 10
 multistep: 10 #${act_seq_len}
 p_last_state: 0
 gen_img_res: 112
-max_epochs: 35
+max_epochs: 20
 rollout_lh_skip_epochs: 9
 num_workers: 12
 benchmark_name: calvin_abc # calvin_abcd
