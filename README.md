@@ -63,7 +63,7 @@ To train the mode model with the maximum amount of available GPUS, run:
 python mode/training.py
 ```
 
-For replication of the orginial training results I recommend to use 4 GPUs with a batch_size of 128 and train them for 20 epochs for ABC (ABCD).
+For replication of the orginial training results I recommend to use 4 GPUs with a batch_size of 128 and train them for 15k steps for CALVIN and LIBERO results, when startin from pretrained weights.
 See configs for details.
 
 #### Preprocessing with CALVIN
