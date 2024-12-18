@@ -31,7 +31,7 @@ max_epochs: 20
 rollout_lh_skip_epochs: 9
 num_workers: 1
 benchmark_name: ${libero_benchmark} 
-libero_benchmark: libero_goal
+libero_benchmark: libero_10
 
 
 trainer:

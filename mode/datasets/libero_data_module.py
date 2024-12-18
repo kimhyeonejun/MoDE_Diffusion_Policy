@@ -4,7 +4,6 @@ from torch.utils.data import DataLoader, ConcatDataset, RandomSampler, random_sp
 import pytorch_lightning as pl
 from omegaconf import DictConfig, OmegaConf
 import hydra
-from pytorch_lightning.utilities import CombinedLoader
 import random
 import numpy as np
 
@@ -247,7 +246,7 @@ class LiberoDataModule(pl.LightningDataModule):
         }
 
     def val_dataloader(self):
-        val_dataloaders = {
+        return {
             key: DataLoader(
                 dataset,
                 batch_size=self.datasets_cfg.lang_dataset.batch_size,
@@ -256,9 +255,6 @@ class LiberoDataModule(pl.LightningDataModule):
                 pin_memory=True,
             ) for key, dataset in self.val_datasets.items()
         }
-        # combined_val_loaders = val_dataloaders['vis']
-        combined_val_loaders = CombinedLoader(val_dataloaders, "sequential")
-        return combined_val_loaders
 
 
 def split_trajectories(num_trajectories, train_ratio=0.8):
