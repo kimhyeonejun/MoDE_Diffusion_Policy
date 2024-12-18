@@ -1,6 +1,6 @@
 # MoDE_Diffusion_Policy
 
-[Paper](h), [Project Page](https://mbreuss.github.io/MoDE_Diffusion_Policy/), 
+[Paper](https://arxiv.org/pdf/2412.12953), [Project Page](https://mbreuss.github.io/MoDE_Diffusion_Policy/), 
 
 
 [Moritz Reuss](https://mbreuss.github.io/)<sup>1</sup>,
