@@ -1,6 +1,6 @@
 defaults:
   - callbacks: libero
-  - datamodule: libero_benchmark
+  - datamodule: libero
   - model: mode_agent
   - override hydra/job_logging: colorlog
   - override hydra/hydra_logging: colorlog
@@ -31,11 +31,11 @@ max_epochs: 20
 rollout_lh_skip_epochs: 9
 num_workers: 1
 benchmark_name: ${libero_benchmark} 
-libero_benchmark: libero_10 
+libero_benchmark: libero_goal
 
 
 trainer:
-  gpus: ${devices}
+  devices: ${devices}
   precision: bf16
   max_epochs: ${max_epochs}
   sync_batchnorm: False
@@ -51,7 +51,7 @@ logger:
   group: mode
   log_model: false
   project: ${libero_benchmark}
-  entity: bennoq
+  entity: omeryagmurlu
   id: ???
 
 

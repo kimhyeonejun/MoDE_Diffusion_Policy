@@ -13,7 +13,6 @@ sigma_min: 0.001
 sigma_max: 80
 noise_scheduler: 'exponential'
 sigma_sample_density_type: 'loglogistic' # 'loglogistic' or 'loguniform'
-ckpt_path: /home/hk-project-sustainebot/ft4740/code/MoDE_Diffusion_Policy/calvin_weights/abc/11-00-17_seed242/seed_242/saved_models/epoch=09_eval_lh/avg_seq_len=4.02.ckpt
 
 start_from_pretrained: True
 act_window_size: ${act_seq_len}

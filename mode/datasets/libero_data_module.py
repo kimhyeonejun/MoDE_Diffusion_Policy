@@ -257,7 +257,7 @@ class LiberoDataModule(pl.LightningDataModule):
             ) for key, dataset in self.val_datasets.items()
         }
         # combined_val_loaders = val_dataloaders['vis']
-        combined_val_loaders = CombinedLoader(val_dataloaders, "max_size_cycle")
+        combined_val_loaders = CombinedLoader(val_dataloaders, "sequential")
         return combined_val_loaders
 
 
