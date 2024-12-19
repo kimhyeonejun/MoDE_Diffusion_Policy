@@ -671,35 +671,6 @@ class MoDEAgent(pl.LightningModule):
         loss, _ = self.model.loss(perceptual_emb, actions, latent_goal, noise, sigmas)
         return loss
     
-    def denoise_actions(  # type: ignore
-        self,
-        latent_plan: torch.Tensor,
-        perceptual_emb: torch.Tensor,
-        latent_goal: torch.Tensor,
-        inference: Optional[bool] = False,
-        extra_args={}
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Denoise the next sequence of actions 
-        """
-        if inference:
-            sampling_steps = self.num_sampling_steps
-        else:
-            sampling_steps = 10
-        self.model.eval()
-        if len(latent_goal.shape) < len(perceptual_emb['state_images'].shape if isinstance(perceptual_emb, dict) else perceptual_emb.shape): 
-            latent_goal = latent_goal.unsqueeze(1) # .expand(-1, seq_len, -1)
-        input_state = perceptual_emb
-        sigmas = self.get_noise_schedule(sampling_steps, self.noise_scheduler)
-        if len(latent_goal.shape) == 2:
-            goal = einops.rearrange(goal, 'b d -> 1 b d')
-
-        x = torch.randn((len(latent_goal), self.act_window_size, 7), device=self.device) * self.sigma_max
-
-        actions = self.sample_loop(sigmas, x, input_state, latent_goal, latent_plan, self.sampler_type, extra_args)
-
-        return actions
-    
     @rank_zero_only
     def on_train_epoch_start(self) -> None:
         logger.info(f"Start training epoch {self.current_epoch}")
