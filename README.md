@@ -100,6 +100,8 @@ Optional params:
 Thanks to @ygtxr1997 for debugging the GPU utilization and providing a merge request.
 
 
+After that modify the following line to add the storage path for your CALVIN dataset: [L9 in config_calvin.yaml](https://github.com/intuitive-robots/MoDE_Diffusion_Policy/blob/main/conf/config_calvin.yaml#L9)
+
 ## Evaluation
 
 Download the pretrained models from Hugging Face: 
