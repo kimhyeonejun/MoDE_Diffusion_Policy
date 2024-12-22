@@ -1,3 +1,5 @@
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/efficient-diffusion-transformer-policies-with/zero-shot-generalization-on-calvin)](https://paperswithcode.com/sota/zero-shot-generalization-on-calvin?p=efficient-diffusion-transformer-policies-with)
+
 # MoDE_Diffusion_Policy
 
 [Paper](https://arxiv.org/pdf/2412.12953), [Project Page](https://mbreuss.github.io/MoDE_Diffusion_Policy/), 
