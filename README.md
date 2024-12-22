@@ -1,4 +1,6 @@
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/efficient-diffusion-transformer-policies-with/zero-shot-generalization-on-calvin)](https://paperswithcode.com/sota/zero-shot-generalization-on-calvin?p=efficient-diffusion-transformer-policies-with)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/efficient-diffusion-transformer-policies-with/on-libero-10)](https://paperswithcode.com/sota/on-libero-10?p=efficient-diffusion-transformer-policies-with)
+[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/efficient-diffusion-transformer-policies-with/on-libero-90)](https://paperswithcode.com/sota/on-libero-90?p=efficient-diffusion-transformer-policies-with)
 
 # MoDE_Diffusion_Policy
 
