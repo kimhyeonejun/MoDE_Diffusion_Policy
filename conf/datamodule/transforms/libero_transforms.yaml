@@ -2,7 +2,7 @@ train:
   rgb_static:
     # - _target_: torchvision.transforms.ToTensor
     - _target_: torchvision.transforms.Resize
-      size: 112
+      size: 224
       antialias: True
     - _target_: mode.utils.transforms.RandomShiftsAug
       pad: 10
@@ -26,7 +26,7 @@ val:
   rgb_static:
     # - _target_: torchvision.transforms.ToTensor
     - _target_: torchvision.transforms.Resize
-      size: 112
+      size: 224
       antialias: True
     - _target_: mode.utils.transforms.ScaleImageTensor
     - _target_: torchvision.transforms.Normalize
