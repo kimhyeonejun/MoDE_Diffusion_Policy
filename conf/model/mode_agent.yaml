@@ -2,7 +2,7 @@ _target_: mode.models.mode_agent.MoDEAgent
 _recursive_: false
 multistep: ${multistep}
 use_lr_scheduler: True
-entropy_gamma: 0.01 
+entropy_gamma: 0.0 # note for finetuning we use 0.0 for training from scratch we need 0.01 
 router_z_delta: 0.00 
 use_proprio: False
 seed: ${seed}
