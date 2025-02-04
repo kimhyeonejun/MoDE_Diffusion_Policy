@@ -19,11 +19,11 @@ torchsde
 einops
 torchdiffeq
 gym
-moviepy
+moviepy==1.0.3
 tqdm
 termcolor
 wandb
 einops_exts
-flash_attn
+flash_attn==2.7.3
 git+https://github.com/openai/CLIP.git
 timm
