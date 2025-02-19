@@ -4,11 +4,11 @@
 
 # MoDE_Diffusion_Policy
 
-[Paper](https://arxiv.org/pdf/2412.12953), [Project Page](https://mbreuss.github.io/MoDE_Diffusion_Policy/), 
+[Paper](https://arxiv.org/pdf/2412.12953), [Project Page](https://mbreuss.github.io/MoDE_Diffusion_Policy/), [ICLR 25](https://openreview.net/pdf?id=nDmwloEl3N)
 
 
 [Moritz Reuss](https://mbreuss.github.io/)<sup>1</sup>,
-[Jyothish Pari](https://jyopari.github.io/aboutMe.html)<sup>1</sup>,
+[Jyothish Pari](https://jyopari.github.io/aboutMe.html)<sup>2</sup>,
 [Pulkit Agrawal](https://people.csail.mit.edu/pulkitag/)<sup>2</sup>,
 [Rudolf Lioutikov](http://rudolf.intuitive-robots.net/)<sup>1</sup>
 
@@ -109,7 +109,7 @@ After that modify the following line to add the storage path for your CALVIN dat
 ## Evaluation
 
 Download the pretrained models from Hugging Face: 
-- [MoDE_CALVIN_ABC](https://huggingface.co/mbreuss/MoDE_CALVIN_ABC)
+- [MoDE_CALVIN_ABC](https://huggingface.co/mbreuss/MoDE_CALVIN_ABC_1) 
 - [MoDE_CALVIN_ABCD](https://huggingface.co/mbreuss/MoDE_CALVIN_ABCD)
 - [MoDE_CALVIN_D](https://huggingface.co/mbreuss/MoDE_CALVIN_D)
 
