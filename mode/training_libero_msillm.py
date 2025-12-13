@@ -14,6 +14,8 @@ import types
 from pytorch_lightning import Callback, LightningModule, seed_everything, Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.utilities import rank_zero_only
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
 
 
 # This is for using the locally installed repo clone when using slurm
@@ -227,6 +229,42 @@ def extract_compression_modules(compression_model: torch.nn.Module) -> Tuple[Opt
     if encoder is None and hasattr(compression_model, "encode"):
         encoder = compression_model
     return encoder, decoder
+
+def load_pretrained_weights_from_hf(model: LightningModule, repo_id: str, filename: str = "model_cleaned.safetensors") -> None:
+    """
+    Load pretrained weights from Hugging Face hub (safetensors format).
+    
+    Args:
+        model: The model to load weights into.
+        repo_id: Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10").
+        filename: Name of the safetensors file (default: "model_cleaned.safetensors").
+    """
+    try:
+        ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
+        log_rank_0(f"Loading pretrained weights from Hugging Face: {repo_id}/{filename}")
+        log_rank_0(f"Checkpoint path: {ckpt_path}")
+        
+        state_dict = load_file(ckpt_path)
+        
+        # Handle potential key prefixes (e.g., "state_dict.", "model.")
+        fixed_state_dict = {}
+        for k, v in state_dict.items():
+            k2 = k
+            if k2.startswith("state_dict."):
+                k2 = k2[len("state_dict."):]
+            if k2.startswith("model."):
+                k2 = k2[len("model."):]
+            fixed_state_dict[k2] = v
+        
+        missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
+        log_rank_0(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
+        if missing:
+            log_rank_0(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
+        if unexpected:
+            log_rank_0(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+    except Exception as e:
+        log_rank_0(f"Failed to load pretrained weights from Hugging Face {repo_id}: {e}")
+        raise
 
 def load_msillm_from_torchhub(cfg: DictConfig) -> Tuple[Optional[torch.nn.Module], Optional[torch.nn.Module]]:
     """
@@ -509,8 +547,18 @@ def train(cfg: DictConfig) -> None:
         )
         # endregion
         
+        # Load pretrained weights if configured
         if "pretrain_chk" in cfg:
-            initialize_pretrained_weights(model, cfg)
+            pretrain_chk = cfg.pretrain_chk
+            # Check if it's a Hugging Face repo ID (contains "/" and doesn't look like a file path)
+            if "/" in str(pretrain_chk) and not Path(pretrain_chk).exists():
+                # Assume it's a Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10")
+                repo_id = str(pretrain_chk)
+                filename = cfg.get("pretrain_chk_filename", "model_cleaned.safetensors")
+                load_pretrained_weights_from_hf(model, repo_id, filename)
+            else:
+                # Use existing local file path loader
+                initialize_pretrained_weights(model, cfg)
             
         # Setup training
         train_logger = setup_logger(cfg, model)
