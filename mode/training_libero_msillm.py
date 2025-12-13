@@ -19,12 +19,19 @@ from safetensors.torch import load_file
 
 
 # This is for using the locally installed repo clone when using slurm
-sys.path.insert(0, Path(__file__).absolute().parents[1].as_posix())
+repo_root = Path(__file__).absolute().parents[1]
+sys.path.insert(0, repo_root.as_posix())
+
+# Add LIBERO submodule to path so 'libero' module can be imported
+libero_repo_dir = repo_root / "LIBERO"
+if libero_repo_dir.exists():
+    sys.path.insert(0, str(libero_repo_dir))
+    # Also set PYTHONPATH environment variable for subprocesses
+    current_pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
+
 import mode.models.mode_agent as models_m
 from mode.utils.utils import get_git_commit_hash, get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
-
-# Add local repo to path
-sys.path.insert(0, str(Path(__file__).absolute().parents[1]))
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
