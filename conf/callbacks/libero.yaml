@@ -10,24 +10,25 @@ ema:
   min_value: 0.0
   max_value: 0.9999
 
-rollout_lh:
-  _target_: mode.rollout.libero_rollout.RolloutLibero
-  _recursive_: false
-  env_cfg:
-    _target_: mode.wrappers.hulc_wrapper.HulcWrapper
-  skip_epochs: ${rollout_lh_skip_epochs}
-  benchmark_name: ${libero_benchmark}
-  rollout_freq: 10
-  num_videos: 0
-  num_sequences: 50 # 128
-  max_steps: 520
-  empty_cache: false
-  debug: false
-  n_eval: 20
-  num_procs: 10
-  use_mp: false
-  task_embedding_format: clip
-  device: ${device}
+# Temporarily disabled rollout_lh callback due to robosuite dependency issue
+# rollout_lh:
+#   _target_: mode.rollout.libero_rollout.RolloutLibero
+#   _recursive_: false
+#   env_cfg:
+#     _target_: mode.wrappers.hulc_wrapper.HulcWrapper
+#   skip_epochs: ${rollout_lh_skip_epochs}
+#   benchmark_name: ${libero_benchmark}
+#   rollout_freq: 10
+#   num_videos: 0
+#   num_sequences: 50 # 128
+#   max_steps: 520
+#   empty_cache: false
+#   debug: false
+#   n_eval: 20
+#   num_procs: 10
+#   use_mp: false
+#   task_embedding_format: clip
+#   device: ${device}
 
 
 checkpoint:
@@ -38,4 +39,4 @@ checkpoint:
   mode: max
   dirpath: saved_models
   filename: '{epoch:02d}_{eval_lh/avg_seq_len:.2f}' #put back in when PL fixes this _{val/accuracy:.4f}'
-  every_n_epochs: ${callbacks.rollout_lh.rollout_freq}
+  every_n_epochs: 1  # Changed from ${callbacks.rollout_lh.rollout_freq} since rollout_lh is disabled

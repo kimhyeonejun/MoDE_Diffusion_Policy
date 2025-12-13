@@ -4,12 +4,12 @@ import torch
 import torch.nn as nn
 import clip 
 from mode.models.networks.clip import build_model, load_clip, tokenize
-from transformers import (
-    AutoProcessor,
-    AutoModel,
-    SiglipProcessor,
-    SiglipModel
-)
+# from transformers import (
+#     AutoProcessor,
+#     AutoModel,
+#     SiglipProcessor,
+#     SiglipModel
+# )
 
 
 class LangClip(nn.Module):

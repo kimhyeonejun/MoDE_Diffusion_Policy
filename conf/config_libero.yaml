@@ -48,6 +48,11 @@ msillm:
   entrypoint: msillm_quality_1
   pretrained: true
 
+# Pretrained MoDE weights from Hugging Face
+# Set to Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10") or local file path
+pretrain_chk: "mbreuss/MoDE_LIBERO_10"
+pretrain_chk_filename: "model_cleaned.safetensors"  # optional, default: model_cleaned.safetensors
+
 
 trainer:
   devices: ${devices}

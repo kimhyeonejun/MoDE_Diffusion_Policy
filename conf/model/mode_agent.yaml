@@ -13,8 +13,8 @@ sigma_min: 0.001
 sigma_max: 80
 noise_scheduler: 'exponential'
 sigma_sample_density_type: 'loglogistic' # 'loglogistic' or 'loguniform'
-ckpt_path: '/path/to/prtrained_weights/'
-start_from_pretrained: True
+ckpt_path: null  # Use pretrain_chk in config_libero.yaml for Hugging Face pretrained weights
+start_from_pretrained: False  # Will be handled by training script via pretrain_chk
 act_window_size: ${act_seq_len}
 latent_dim: 1024
 obs_enc_dim: ${obs_dim}

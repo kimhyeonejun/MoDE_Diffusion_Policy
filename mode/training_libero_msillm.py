@@ -217,7 +217,20 @@ def log_rank_0(*args, **kwargs):
     logger.info(*args, **kwargs)
 
 def setup_callbacks(callbacks_cfg: DictConfig) -> list[Callback]:
-    return [hydra.utils.instantiate(cb) for cb in callbacks_cfg.values()]
+    result = []
+    for cb_name, cb_cfg in callbacks_cfg.items():
+        # Skip rollout_lh callback if it's disabled or causes import errors
+        if cb_name == "rollout_lh":
+            try:
+                cb = hydra.utils.instantiate(cb_cfg)
+                result.append(cb)
+            except (ImportError, ModuleNotFoundError) as e:
+                logger.warning(f"Skipping {cb_name} callback due to import error: {e}")
+                continue
+        else:
+            cb = hydra.utils.instantiate(cb_cfg)
+            result.append(cb)
+    return result
 
 def setup_logger(cfg: DictConfig, model: LightningModule):
     pathlib_cwd = Path.cwd()
