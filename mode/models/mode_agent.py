@@ -3,6 +3,9 @@ import os
 from typing import Any, Dict, Optional, Tuple, List, DefaultDict
 from functools import partial
 import seaborn as sns
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
 
 import torch
 import hydra
@@ -486,27 +489,28 @@ class MoDEAgent(pl.LightningModule):
             expert_usage_data_normalized = expert_usage_data / row_sums
             # print(expert_usage_data_normalized)  # Disabled to avoid cluttering terminal output
             # Plotting the heatmap
-            plt.figure(figsize=(12, 8))
+            fig, ax = plt.subplots(figsize=(12, 8))
             sns.heatmap(
                 expert_usage_data_normalized, 
                 annot=True, 
                 fmt=".2f", 
                 cmap="coolwarm", 
                 xticklabels=range(expert_usage_data_normalized.shape[1]), 
-                yticklabels=[f'blocks.{i}' for i in range(expert_usage_data_normalized.shape[0])]
+                yticklabels=[f'blocks.{i}' for i in range(expert_usage_data_normalized.shape[0])],
+                ax=ax
             )
-            plt.xlabel('Expert Index')
-            plt.ylabel('Block Number')
-            plt.title(f'Expert Usage across Blocks (Epoch {epoch})')
+            ax.set_xlabel('Expert Index')
+            ax.set_ylabel('Block Number')
+            ax.set_title(f'Expert Usage across Blocks (Epoch {epoch})')
             
             # Log the plot to wandb
             # Log to wandb with additional metadata
             self.logger.experiment.log({
-                "MoE_utils/expert_usage_heatmap": wandb.Image(plt),
+                "MoE_utils/expert_usage_heatmap": wandb.Image(fig),
                 "epoch": epoch
             })
 
-            plt.close()
+            plt.close(fig)
         else:
             print(f"No expert usage data to log for epoch {epoch}")
 
