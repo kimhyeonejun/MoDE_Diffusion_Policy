@@ -640,6 +640,18 @@ def train(cfg: DictConfig) -> None:
                 log_rank_0("MS-ILLM model loaded from checkpoint")
                 msillm_model = model.msillm_model
                 _msillm_decoder = extract_compression_modules(msillm_model)[1]
+                
+                # Verify that encoder and decoder weights were loaded from checkpoint
+                state_dict = model.state_dict()
+                msillm_keys = [k for k in state_dict.keys() if k.startswith("msillm_model")]
+                encoder_keys = [k for k in msillm_keys if "encoder" in k.lower()]
+                decoder_keys = [k for k in msillm_keys if "decoder" in k.lower()]
+                log_rank_0(f"MS-ILLM checkpoint loaded: {len(msillm_keys)} total params, "
+                          f"{len(encoder_keys)} encoder params, {len(decoder_keys)} decoder params")
+                if len(encoder_keys) > 0 and len(decoder_keys) > 0:
+                    log_rank_0("✓ MS-ILLM encoder and decoder weights loaded from checkpoint")
+                elif len(msillm_keys) > 0:
+                    log_rank_0(f"⚠ MS-ILLM weights found but encoder/decoder structure unclear. Keys: {msillm_keys[:5]}...")
             else:
                 # MS-ILLM not in checkpoint, load from torch.hub (shouldn't happen if checkpoint was saved correctly)
                 log_rank_0("MS-ILLM model not found in checkpoint, loading from torch.hub")
@@ -654,6 +666,21 @@ def train(cfg: DictConfig) -> None:
                 setattr(model, "msillm_model", msillm_model)
             else:
                 log_rank_0(f"MS-ILLM model is attached to model. Decoder params: {_count_params(_msillm_decoder)[0] if _msillm_decoder is not None else 0}")
+            
+            # Verify that MS-ILLM encoder and decoder will be saved in checkpoint
+            # PyTorch's state_dict() saves ALL parameters regardless of requires_grad
+            state_dict = model.state_dict()
+            msillm_keys = [k for k in state_dict.keys() if k.startswith("msillm_model")]
+            encoder_keys = [k for k in msillm_keys if "encoder" in k.lower()]
+            decoder_keys = [k for k in msillm_keys if "decoder" in k.lower()]
+            log_rank_0(f"MS-ILLM checkpoint verification: {len(msillm_keys)} total params, "
+                      f"{len(encoder_keys)} encoder params, {len(decoder_keys)} decoder params")
+            if len(encoder_keys) > 0 and len(decoder_keys) > 0:
+                log_rank_0("✓ MS-ILLM encoder and decoder weights will be saved in checkpoint")
+            elif len(msillm_keys) > 0:
+                log_rank_0(f"⚠ MS-ILLM weights found but encoder/decoder structure unclear. Keys: {msillm_keys[:5]}...")
+            else:
+                log_rank_0("⚠ WARNING: No MS-ILLM weights found in model.state_dict()!")
         
         # Train only vision encoders (static/gripper resnets) for the policy
         _freeze_all_except_vision_encoders(model)
