@@ -44,7 +44,8 @@ libero_benchmark: libero_10
 
 msillm:
   # torch.hub entrypoint (NeuralCompression hubconf) for MS-ILLM
-  hub_repo: facebookresearch/NeuralCompression:v0.3.1
+  # Note: msillm_quality_vlo1 is only available in 'main' branch, not in v0.3.1 tag
+  hub_repo: facebookresearch/NeuralCompression:main  # Changed from v0.3.1 to main for msillm_quality_vlo1
   entrypoint: msillm_quality_vlo1
   pretrained: true
 
