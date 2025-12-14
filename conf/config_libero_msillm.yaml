@@ -53,6 +53,7 @@ msillm:
 # Use val_act/lang_act_loss_pp instead for monitoring
 callbacks:
   checkpoint:
+    save_top_k: 3
     monitor: val_act/lang_act_loss_pp  # Changed from eval_lh/avg_seq_len since rollout_lh callback is disabled
     mode: min  # Changed from max since we want to minimize loss
     filename: '{epoch:02d}_{val_act/lang_act_loss_pp:.4f}'  # Updated filename to match new monitor metric
