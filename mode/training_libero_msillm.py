@@ -228,12 +228,13 @@ def setup_callbacks(callbacks_cfg: DictConfig, msillm_info: str = "") -> list[Ca
                 logger.warning(f"Skipping {cb_name} callback due to import error: {e}")
                 continue
         else:
+            # Update checkpoint filename in config before instantiation if MS-ILLM info is available
+            if cb_name == "checkpoint" and msillm_info and "filename" in cb_cfg:
+                original_filename = cb_cfg.get("filename", "epoch={epoch:02d}")
+                # Prepend MS-ILLM info to filename
+                cb_cfg["filename"] = f"{msillm_info}_{original_filename}"
+            
             cb = hydra.utils.instantiate(cb_cfg)
-            # Update checkpoint filename to include MS-ILLM info
-            if cb_name == "checkpoint" and hasattr(cb, 'filename') and msillm_info:
-                original_filename = cb.filename if cb.filename else 'epoch={epoch:02d}'
-                # Insert MS-ILLM info before epoch
-                cb.filename = f"{msillm_info}_{original_filename}"
             result.append(cb)
     return result
 
@@ -270,14 +271,24 @@ def setup_logger(cfg: DictConfig, model: LightningModule):
         cfg.logger.name = f"{base_name}{msillm_suffix}"
         cfg.logger.id = cfg.logger.name.replace("/", "_").replace(":", "_")
     
+    # Add MS-ILLM tags to logger config if available
+    if msillm_info and "tags" not in cfg.logger:
+        cfg.logger.tags = [msillm_info, "msillm-training"]
+    elif msillm_info and "tags" in cfg.logger:
+        # Merge with existing tags
+        existing_tags = cfg.logger.tags if isinstance(cfg.logger.tags, list) else [cfg.logger.tags]
+        if msillm_info not in existing_tags:
+            cfg.logger.tags = existing_tags + [msillm_info, "msillm-training"]
+    
     # Add MS-ILLM config to wandb config
     logger_instance = hydra.utils.instantiate(cfg.logger)
     if hasattr(logger_instance, 'experiment') and logger_instance.experiment is not None:
         if "msillm" in cfg:
+            msillm_cfg = cfg.msillm
             logger_instance.experiment.config.update({
-                "msillm_hub_repo": cfg.msillm.get("hub_repo", "unknown"),
-                "msillm_entrypoint": cfg.msillm.get("entrypoint", "unknown"),
-                "msillm_pretrained": cfg.msillm.get("pretrained", False),
+                "msillm_hub_repo": msillm_cfg.get("hub_repo", "unknown"),
+                "msillm_entrypoint": msillm_cfg.get("entrypoint", "unknown"),
+                "msillm_pretrained": msillm_cfg.get("pretrained", False),
                 "msillm_identifier": msillm_info,
             })
     
@@ -625,7 +636,8 @@ def train(cfg: DictConfig) -> None:
             
         # Setup training
         train_logger = setup_logger(cfg, model)
-        callbacks = setup_callbacks(cfg.callbacks) + [LearningRateMonitor(logging_interval="step")]
+        msillm_info = get_msillm_identifier(cfg)
+        callbacks = setup_callbacks(cfg.callbacks, msillm_info=msillm_info) + [LearningRateMonitor(logging_interval="step")]
         
         # Set unique working directory for each seed
         work_dir = Path.cwd() / f"seed_{cfg.seed}"
@@ -645,11 +657,14 @@ def train(cfg: DictConfig) -> None:
             "sync_batchnorm": True,
         }
         
-        # Log checkpoint save path
+        # Log checkpoint save path with MS-ILLM info
         checkpoint_callback = next((cb for cb in callbacks if hasattr(cb, 'dirpath')), None)
         if checkpoint_callback is not None:
             checkpoint_dir = Path(checkpoint_callback.dirpath).resolve() if checkpoint_callback.dirpath else work_dir / "saved_models"
-            log_rank_0(f"Checkpoints will be saved to: {checkpoint_dir}")
+            msillm_info_str = f" (MS-ILLM: {msillm_info})" if msillm_info else " (no MS-ILLM)"
+            log_rank_0(f"Checkpoints will be saved to: {checkpoint_dir}{msillm_info_str}")
+            if hasattr(checkpoint_callback, 'filename'):
+                log_rank_0(f"Checkpoint filename pattern: {checkpoint_callback.filename}")
         
         # Log configuration
         log_rank_0(f"Training config for seed {cfg.seed}:\n{cfg}")
