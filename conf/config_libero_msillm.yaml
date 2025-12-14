@@ -48,6 +48,15 @@ msillm:
   entrypoint: msillm_quality_1
   pretrained: true
 
+# Override checkpoint callback for MS-ILLM training
+# Since rollout_lh callback is disabled, eval_lh/avg_seq_len is not available
+# Use val_act/lang_act_loss_pp instead for monitoring
+callbacks:
+  checkpoint:
+    monitor: val_act/lang_act_loss_pp  # Changed from eval_lh/avg_seq_len since rollout_lh callback is disabled
+    mode: min  # Changed from max since we want to minimize loss
+    filename: '{epoch:02d}_{val_act/lang_act_loss_pp:.4f}'  # Updated filename to match new monitor metric
+
 # Pretrained MoDE weights from Hugging Face
 # Set to Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10") or local file path
 pretrain_chk: "mbreuss/MoDE_LIBERO_10"
