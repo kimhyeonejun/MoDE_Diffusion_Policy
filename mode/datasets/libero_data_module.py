@@ -10,7 +10,7 @@ import numpy as np
 from libero.libero import benchmark, get_libero_path
 from libero.libero.benchmark import get_benchmark
 from libero.lifelong.datasets import (GroupedTaskDataset, SequenceVLDataset)
-from libero.lifelong.utils import (get_task_embs, safe_device, create_experiment_dir)
+from libero.lifelong.utils import (safe_device, create_experiment_dir)
 
 from mode.datasets.utils.libero_utils import get_dataset, get_split_dataset
 
@@ -179,8 +179,9 @@ class LiberoDataModule(pl.LightningDataModule):
             )
             descriptions.append(benchmark_instance.get_task(i).language)
 
-            task_embs = get_task_embs(self.cfg, descriptions)
-            benchmark_instance.set_task_embs(task_embs)
+            # MoDE uses its own LangClip for language encoding, so we don't need LIBERO's task embeddings
+            # task_embs = get_task_embs(self.cfg, descriptions)
+            # benchmark_instance.set_task_embs(task_embs)
             # vl_img_dataset = TranslatedImgGoalSequenceVLDataset(
             #     task_i_dataset[0],
             #     task_embs[i],
@@ -191,7 +192,7 @@ class LiberoDataModule(pl.LightningDataModule):
             vl_dataset = TranslatedSequenceVLDataset(
                 # task_i_dataset[1],
                 task_i_dataset,
-                task_embs[i],
+                None,  # task_emb is not used by MoDE (it uses LangClip instead)
                 descriptions[i],
                 act_seq_len=datasets_cfg.lang_dataset.action_seq_len,
                 obs_seq_len=datasets_cfg.lang_dataset.obs_seq_len,
