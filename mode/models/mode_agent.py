@@ -484,7 +484,7 @@ class MoDEAgent(pl.LightningModule):
             row_sums = expert_usage_data.sum(axis=1, keepdims=True)
             row_sums = np.maximum(row_sums, 1e-8)  # Avoid division by zero
             expert_usage_data_normalized = expert_usage_data / row_sums
-            print(expert_usage_data_normalized)
+            # print(expert_usage_data_normalized)  # Disabled to avoid cluttering terminal output
             # Plotting the heatmap
             plt.figure(figsize=(12, 8))
             sns.heatmap(
