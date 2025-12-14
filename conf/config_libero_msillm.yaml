@@ -45,7 +45,7 @@ libero_benchmark: libero_10
 msillm:
   # torch.hub entrypoint (NeuralCompression hubconf) for MS-ILLM
   hub_repo: facebookresearch/NeuralCompression:v0.3.1
-  entrypoint: msillm_quality_1
+  entrypoint: msillm_quality_vlo1
   pretrained: true
 
 # Override checkpoint callback for MS-ILLM training
