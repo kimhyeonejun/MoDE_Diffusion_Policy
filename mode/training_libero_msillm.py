@@ -263,13 +263,17 @@ def setup_logger(cfg: DictConfig, model: LightningModule):
     
     # Build MS-ILLM identifier string
     msillm_info = get_msillm_identifier(cfg)
-    msillm_suffix = f"_{msillm_info}" if msillm_info else ""
     
     if "group" in cfg.logger:
         cfg.logger.group = pathlib_cwd.parent.name
-        base_name = f"{pathlib_cwd.parent.name}/{pathlib_cwd.name}"
-        cfg.logger.name = f"{base_name}{msillm_suffix}"
-        cfg.logger.id = cfg.logger.name.replace("/", "_").replace(":", "_")
+        # Use MS-ILLM info as name if available, otherwise use default path-based name
+        if msillm_info:
+            cfg.logger.name = msillm_info
+            cfg.logger.id = msillm_info.replace("/", "_").replace(":", "_")
+        else:
+            base_name = f"{pathlib_cwd.parent.name}/{pathlib_cwd.name}"
+            cfg.logger.name = base_name
+            cfg.logger.id = cfg.logger.name.replace("/", "_").replace(":", "_")
     
     # Add MS-ILLM tags to logger config if available
     if msillm_info and "tags" not in cfg.logger:
