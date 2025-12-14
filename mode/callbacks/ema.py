@@ -117,7 +117,8 @@ class EMA(Callback):
     def apply_ema(self, pl_module: "pl.LightningModule") -> None:
         decay = self.get_decay(self._cur_step)
         for orig_weight, ema_weight in zip(list(pl_module.state_dict().values()), self._ema_model_weights):
-            if orig_weight.dtype == torch.uint8 or orig_weight.dtype == torch.int64:
+            # Skip EMA for non-floating point types (int, uint, bool, etc.)
+            if not orig_weight.dtype.is_floating_point:
                 ema_weight.data = orig_weight.data.clone()
             else:
                 diff = ema_weight.data - orig_weight.data
