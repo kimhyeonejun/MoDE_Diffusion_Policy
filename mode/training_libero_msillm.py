@@ -602,6 +602,12 @@ def train(cfg: DictConfig) -> None:
             "sync_batchnorm": True,
         }
         
+        # Log checkpoint save path
+        checkpoint_callback = next((cb for cb in callbacks if hasattr(cb, 'dirpath')), None)
+        if checkpoint_callback is not None:
+            checkpoint_dir = Path(checkpoint_callback.dirpath).resolve() if checkpoint_callback.dirpath else work_dir / "saved_models"
+            log_rank_0(f"Checkpoints will be saved to: {checkpoint_dir}")
+        
         # Log configuration
         log_rank_0(f"Training config for seed {cfg.seed}:\n{cfg}")
         log_rank_0(f"Git commit: {get_git_commit_hash(Path(hydra.utils.to_absolute_path(__file__)))}")
