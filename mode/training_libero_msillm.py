@@ -624,14 +624,37 @@ def train(cfg: DictConfig) -> None:
         log_rank_0(f"\nInitializing training for seed {cfg.seed}")
         datamodule = hydra.utils.instantiate(cfg.datamodule)
 
-        model = hydra.utils.instantiate(cfg.model) if get_last_checkpoint(Path.cwd()) is None else \
-               getattr(models_m, cfg.model["_target_"].split(".")[-1]).load_from_checkpoint(get_last_checkpoint(Path.cwd()).as_posix())
+        # Check if we're resuming from checkpoint
+        last_checkpoint = get_last_checkpoint(Path.cwd())
+        if last_checkpoint is None:
+            model = hydra.utils.instantiate(cfg.model)
+            # Load MS-ILLM (pretrained) if configured and attach as a submodule so Lightning moves it with the model.
+            msillm_model, _msillm_decoder = load_msillm_from_torchhub(cfg)
+            if msillm_model is not None:
+                setattr(model, "msillm_model", msillm_model)
+        else:
+            # Load model from checkpoint (this should include msillm_model if it was saved)
+            model = getattr(models_m, cfg.model["_target_"].split(".")[-1]).load_from_checkpoint(last_checkpoint.as_posix())
+            # Check if msillm_model was loaded from checkpoint
+            if hasattr(model, "msillm_model") and model.msillm_model is not None:
+                log_rank_0("MS-ILLM model loaded from checkpoint")
+                msillm_model = model.msillm_model
+                _msillm_decoder = extract_compression_modules(msillm_model)[1]
+            else:
+                # MS-ILLM not in checkpoint, load from torch.hub (shouldn't happen if checkpoint was saved correctly)
+                log_rank_0("MS-ILLM model not found in checkpoint, loading from torch.hub")
+                msillm_model, _msillm_decoder = load_msillm_from_torchhub(cfg)
+                if msillm_model is not None:
+                    setattr(model, "msillm_model", msillm_model)
 
-        # Load MS-ILLM (pretrained) if configured and attach as a submodule so Lightning moves it with the model.
-        msillm_model, _msillm_decoder = load_msillm_from_torchhub(cfg)
+        # Verify MS-ILLM is attached to model (for checkpoint saving)
         if msillm_model is not None:
-            setattr(model, "msillm_model", msillm_model)
-
+            if not hasattr(model, "msillm_model") or model.msillm_model is None:
+                log_rank_0("WARNING: MS-ILLM model exists but is not attached to model. Attaching now...")
+                setattr(model, "msillm_model", msillm_model)
+            else:
+                log_rank_0(f"MS-ILLM model is attached to model. Decoder params: {_count_params(_msillm_decoder)[0] if _msillm_decoder is not None else 0}")
+        
         # Train only vision encoders (static/gripper resnets) for the policy
         _freeze_all_except_vision_encoders(model)
 
