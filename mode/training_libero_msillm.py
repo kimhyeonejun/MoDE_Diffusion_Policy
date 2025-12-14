@@ -216,7 +216,27 @@ def clear_cuda_cache():
 def log_rank_0(*args, **kwargs):
     logger.info(*args, **kwargs)
 
-def setup_callbacks(callbacks_cfg: DictConfig) -> list[Callback]:
+def get_msillm_identifier(cfg: DictConfig) -> str:
+    """
+    Build MS-ILLM identifier string for use in wandb names and checkpoint filenames.
+    
+    Returns:
+        String like "msillm-NeuralCompression_v0.3.1-msillm_quality_1" or empty string if not configured.
+    """
+    if "msillm" not in cfg:
+        return ""
+    
+    msillm_cfg = cfg.msillm
+    hub_repo = msillm_cfg.get("hub_repo", "unknown")
+    entrypoint = msillm_cfg.get("entrypoint", "unknown")
+    # Extract repo name (e.g., "facebookresearch/NeuralCompression:v0.3.1" -> "NeuralCompression_v0.3.1")
+    repo_name = hub_repo.split("/")[-1].replace(":", "_") if "/" in hub_repo else hub_repo
+    # Sanitize for filename: replace special chars
+    repo_name = repo_name.replace("/", "_").replace(":", "_")
+    entrypoint = entrypoint.replace("/", "_").replace(":", "_")
+    return f"msillm-{repo_name}-{entrypoint}"
+
+def setup_callbacks(callbacks_cfg: DictConfig, msillm_info: str = "") -> list[Callback]:
     result = []
     for cb_name, cb_cfg in callbacks_cfg.items():
         # Skip rollout_lh callback if it's disabled or causes import errors
@@ -228,17 +248,69 @@ def setup_callbacks(callbacks_cfg: DictConfig) -> list[Callback]:
                 logger.warning(f"Skipping {cb_name} callback due to import error: {e}")
                 continue
         else:
+            # Update checkpoint filename in config before instantiation if MS-ILLM info is available
+            if cb_name == "checkpoint" and msillm_info and "filename" in cb_cfg:
+                original_filename = cb_cfg.get("filename", "epoch={epoch:02d}")
+                # Prepend MS-ILLM info to filename
+                cb_cfg["filename"] = f"{msillm_info}_{original_filename}"
+            
             cb = hydra.utils.instantiate(cb_cfg)
             result.append(cb)
     return result
 
 def setup_logger(cfg: DictConfig, model: LightningModule):
     pathlib_cwd = Path.cwd()
+    
+    # Build MS-ILLM identifier string
+    msillm_info = get_msillm_identifier(cfg)
+    
     if "group" in cfg.logger:
         cfg.logger.group = pathlib_cwd.parent.name
-        cfg.logger.name = f"{pathlib_cwd.parent.name}/{pathlib_cwd.name}"
-        cfg.logger.id = cfg.logger.name.replace("/", "_")
-    return hydra.utils.instantiate(cfg.logger)
+        # Use MS-ILLM info as name if available, otherwise use default path-based name
+        if msillm_info:
+            cfg.logger.name = msillm_info
+            cfg.logger.id = msillm_info.replace("/", "_").replace(":", "_")
+        else:
+            base_name = f"{pathlib_cwd.parent.name}/{pathlib_cwd.name}"
+            cfg.logger.name = base_name
+            cfg.logger.id = cfg.logger.name.replace("/", "_").replace(":", "_")
+    
+    # Instantiate logger first (before setting tags to avoid struct mode issues)
+    logger_instance = hydra.utils.instantiate(cfg.logger)
+    
+    # Set tags after instantiation (WandbLogger supports this)
+    if msillm_info:
+        msillm_tags = [msillm_info, "msillm-training"]
+        # Try to set tags via logger instance
+        if hasattr(logger_instance, 'tags'):
+            existing_tags = logger_instance.tags if logger_instance.tags else []
+            if isinstance(existing_tags, list):
+                logger_instance.tags = existing_tags + msillm_tags
+            else:
+                logger_instance.tags = msillm_tags
+        # Also try via experiment API
+        if hasattr(logger_instance, 'experiment') and logger_instance.experiment is not None:
+            try:
+                current_tags = getattr(logger_instance.experiment, 'tags', []) or []
+                if isinstance(current_tags, list):
+                    logger_instance.experiment.tags = current_tags + msillm_tags
+                else:
+                    logger_instance.experiment.tags = msillm_tags
+            except:
+                pass  # Some wandb versions may not support this
+    
+    # Add MS-ILLM config to wandb config
+    if hasattr(logger_instance, 'experiment') and logger_instance.experiment is not None:
+        if "msillm" in cfg:
+            msillm_cfg = cfg.msillm
+            logger_instance.experiment.config.update({
+                "msillm_hub_repo": msillm_cfg.get("hub_repo", "unknown"),
+                "msillm_entrypoint": msillm_cfg.get("entrypoint", "unknown"),
+                "msillm_pretrained": msillm_cfg.get("pretrained", False),
+                "msillm_identifier": msillm_info,
+            })
+    
+    return logger_instance
 
 def extract_compression_modules(compression_model: torch.nn.Module) -> Tuple[Optional[torch.nn.Module], Optional[torch.nn.Module]]:
     """
