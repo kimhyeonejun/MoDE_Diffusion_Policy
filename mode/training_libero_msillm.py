@@ -303,12 +303,33 @@ def setup_logger(cfg: DictConfig, model: LightningModule):
     if hasattr(logger_instance, 'experiment') and logger_instance.experiment is not None:
         if "msillm" in cfg:
             msillm_cfg = cfg.msillm
-            logger_instance.experiment.config.update({
+            config_dict = {
                 "msillm_hub_repo": msillm_cfg.get("hub_repo", "unknown"),
                 "msillm_entrypoint": msillm_cfg.get("entrypoint", "unknown"),
                 "msillm_pretrained": msillm_cfg.get("pretrained", False),
                 "msillm_identifier": msillm_info,
-            })
+            }
+            try:
+                # Try to access config as an object with update method
+                config_obj = logger_instance.experiment.config
+                if hasattr(config_obj, 'update'):
+                    config_obj.update(config_dict)
+                elif callable(config_obj):
+                    # If config is a function, it might need to be called or accessed differently
+                    # Try using wandb.config directly if available
+                    if wandb.run is not None:
+                        wandb.config.update(config_dict)
+                else:
+                    # Fallback: try to update via wandb.config
+                    if wandb.run is not None:
+                        wandb.config.update(config_dict)
+            except Exception as e:
+                # Fallback: use wandb.config directly if experiment.config doesn't work
+                try:
+                    if wandb.run is not None:
+                        wandb.config.update(config_dict)
+                except:
+                    pass  # Some wandb versions may not support this
     
     return logger_instance
 
