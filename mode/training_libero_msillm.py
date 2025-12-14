@@ -511,7 +511,7 @@ def run_image_compression_phase(cfg: DictConfig, base_work_dir: Path) -> Tuple[O
     clear_cuda_cache()
     return comp_model, ckpt_path
 
-@hydra.main(config_path="../conf", config_name="config_libero")
+@hydra.main(config_path="../conf", config_name="config_libero_msillm")
 def train(cfg: DictConfig) -> None:
     try:
         # Setup environment
