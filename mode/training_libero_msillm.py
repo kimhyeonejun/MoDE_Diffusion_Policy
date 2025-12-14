@@ -216,7 +216,7 @@ def clear_cuda_cache():
 def log_rank_0(*args, **kwargs):
     logger.info(*args, **kwargs)
 
-def setup_callbacks(callbacks_cfg: DictConfig) -> list[Callback]:
+def setup_callbacks(callbacks_cfg: DictConfig, msillm_info: str = "") -> list[Callback]:
     result = []
     for cb_name, cb_cfg in callbacks_cfg.items():
         # Skip rollout_lh callback if it's disabled or causes import errors
@@ -229,16 +229,59 @@ def setup_callbacks(callbacks_cfg: DictConfig) -> list[Callback]:
                 continue
         else:
             cb = hydra.utils.instantiate(cb_cfg)
+            # Update checkpoint filename to include MS-ILLM info
+            if cb_name == "checkpoint" and hasattr(cb, 'filename') and msillm_info:
+                original_filename = cb.filename if cb.filename else 'epoch={epoch:02d}'
+                # Insert MS-ILLM info before epoch
+                cb.filename = f"{msillm_info}_{original_filename}"
             result.append(cb)
     return result
 
+def get_msillm_identifier(cfg: DictConfig) -> str:
+    """
+    Build MS-ILLM identifier string for use in wandb names and checkpoint filenames.
+    
+    Returns:
+        String like "_msillm-NeuralCompression_v0.3.1-msillm_quality_1" or empty string if not configured.
+    """
+    if "msillm" not in cfg:
+        return ""
+    
+    msillm_cfg = cfg.msillm
+    hub_repo = msillm_cfg.get("hub_repo", "unknown")
+    entrypoint = msillm_cfg.get("entrypoint", "unknown")
+    # Extract repo name (e.g., "facebookresearch/NeuralCompression:v0.3.1" -> "NeuralCompression_v0.3.1")
+    repo_name = hub_repo.split("/")[-1].replace(":", "_") if "/" in hub_repo else hub_repo
+    # Sanitize for filename: replace special chars
+    repo_name = repo_name.replace("/", "_").replace(":", "_")
+    entrypoint = entrypoint.replace("/", "_").replace(":", "_")
+    return f"msillm-{repo_name}-{entrypoint}"
+
 def setup_logger(cfg: DictConfig, model: LightningModule):
     pathlib_cwd = Path.cwd()
+    
+    # Build MS-ILLM identifier string
+    msillm_info = get_msillm_identifier(cfg)
+    msillm_suffix = f"_{msillm_info}" if msillm_info else ""
+    
     if "group" in cfg.logger:
         cfg.logger.group = pathlib_cwd.parent.name
-        cfg.logger.name = f"{pathlib_cwd.parent.name}/{pathlib_cwd.name}"
-        cfg.logger.id = cfg.logger.name.replace("/", "_")
-    return hydra.utils.instantiate(cfg.logger)
+        base_name = f"{pathlib_cwd.parent.name}/{pathlib_cwd.name}"
+        cfg.logger.name = f"{base_name}{msillm_suffix}"
+        cfg.logger.id = cfg.logger.name.replace("/", "_").replace(":", "_")
+    
+    # Add MS-ILLM config to wandb config
+    logger_instance = hydra.utils.instantiate(cfg.logger)
+    if hasattr(logger_instance, 'experiment') and logger_instance.experiment is not None:
+        if "msillm" in cfg:
+            logger_instance.experiment.config.update({
+                "msillm_hub_repo": cfg.msillm.get("hub_repo", "unknown"),
+                "msillm_entrypoint": cfg.msillm.get("entrypoint", "unknown"),
+                "msillm_pretrained": cfg.msillm.get("pretrained", False),
+                "msillm_identifier": msillm_info,
+            })
+    
+    return logger_instance
 
 def extract_compression_modules(compression_model: torch.nn.Module) -> Tuple[Optional[torch.nn.Module], Optional[torch.nn.Module]]:
     """
