@@ -151,6 +151,10 @@ def create_experiment_dir(cfg):
 
 def get_task_embs(cfg, descriptions):
     logging.set_verbosity_error()
+    
+    # Ensure HF_ENDPOINT is set correctly to avoid URL scheme issues
+    if "HF_ENDPOINT" not in os.environ or not os.environ.get("HF_ENDPOINT", "").startswith("http"):
+        os.environ["HF_ENDPOINT"] = "https://huggingface.co"
 
     if cfg.task_embedding_format == "one-hot":
         # offset defaults to 1, if we have pretrained another model, this offset
@@ -179,9 +183,13 @@ def get_task_embs(cfg, descriptions):
             "pooler_output"
         ].detach()
     elif cfg.task_embedding_format == "gpt2":
-        tz = AutoTokenizer.from_pretrained("gpt2")
+        try:
+            tz = AutoTokenizer.from_pretrained("gpt2", local_files_only=True)
+            model = AutoModel.from_pretrained("gpt2", local_files_only=True)
+        except (OSError, ValueError):
+            tz = AutoTokenizer.from_pretrained("gpt2", local_files_only=False)
+            model = AutoModel.from_pretrained("gpt2", local_files_only=False)
         tz.pad_token = tz.eos_token
-        model = AutoModel.from_pretrained("gpt2")
         tokens = tz(
             text=descriptions,  # the sentence to be encoded
             add_special_tokens=True,  # Add [CLS] and [SEP]
@@ -192,8 +200,16 @@ def get_task_embs(cfg, descriptions):
         )
         task_embs = model(**tokens)["last_hidden_state"].detach()[:, -1]
     elif cfg.task_embedding_format == "clip":
-        tz = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
-        model = AutoModel.from_pretrained("openai/clip-vit-base-patch32")
+        # Try local cache first, then fallback to network if needed
+        try:
+            tz = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True)
+            model = AutoModel.from_pretrained("openai/clip-vit-base-patch32", local_files_only=True)
+        except (OSError, ValueError) as e:
+            # If local cache fails, try with network
+            import warnings
+            warnings.warn(f"Failed to load from local cache, trying network: {e}")
+            tz = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32", local_files_only=False)
+            model = AutoModel.from_pretrained("openai/clip-vit-base-patch32", local_files_only=False)
         tokens = tz(
             text=descriptions,  # the sentence to be encoded
             add_special_tokens=True,  # Add [CLS] and [SEP]
@@ -204,9 +220,13 @@ def get_task_embs(cfg, descriptions):
         )
         task_embs = model.get_text_features(**tokens).detach()
     elif cfg.task_embedding_format == "roberta":
-        tz = AutoTokenizer.from_pretrained("roberta-base")
+        try:
+            tz = AutoTokenizer.from_pretrained("roberta-base", local_files_only=True)
+            model = AutoModel.from_pretrained("roberta-base", local_files_only=True)
+        except (OSError, ValueError):
+            tz = AutoTokenizer.from_pretrained("roberta-base", local_files_only=False)
+            model = AutoModel.from_pretrained("roberta-base", local_files_only=False)
         tz.pad_token = tz.eos_token
-        model = AutoModel.from_pretrained("roberta-base")
         tokens = tz(
             text=descriptions,  # the sentence to be encoded
             add_special_tokens=True,  # Add [CLS] and [SEP]
