@@ -23,7 +23,7 @@ slurm: false
 future_range: 29
 seed: 42
 device: 'cuda'
-batch_size: 256 # 38 # 128
+batch_size: 128 # 38 # 128
 # Number of GPU devices to use (passed through to `trainer.devices` below).
 devices: 2
 goal_window_size: 1
