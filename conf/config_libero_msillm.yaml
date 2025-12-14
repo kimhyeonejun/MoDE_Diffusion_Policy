@@ -73,7 +73,7 @@ trainer:
   sync_batchnorm: False
   accelerator: auto
   limit_train_batches: 1000
-  limit_val_batches: 4
+  limit_val_batches: 100
   # gradient_clip_val: 1
 
 logger:
