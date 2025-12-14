@@ -557,7 +557,8 @@ def run_image_compression_phase(cfg: DictConfig, base_work_dir: Path) -> Tuple[O
 
     comp_logger = setup_logger(comp_cfg, comp_model) if "logger" in comp_cfg else setup_logger(cfg, comp_model)
     callbacks_cfg = comp_cfg.callbacks if "callbacks" in comp_cfg else cfg.callbacks
-    comp_callbacks = setup_callbacks(callbacks_cfg) + [LearningRateMonitor(logging_interval="step")]
+    comp_msillm_info = get_msillm_identifier(comp_cfg if "msillm" in comp_cfg else cfg)
+    comp_callbacks = setup_callbacks(callbacks_cfg, msillm_info=comp_msillm_info) + [LearningRateMonitor(logging_interval="step")]
 
     work_dir = base_work_dir / "phase1_image_compression"
     work_dir.mkdir(exist_ok=True)
@@ -654,7 +655,8 @@ def train(cfg: DictConfig) -> None:
             
         # Setup training
         train_logger = setup_logger(cfg, model)
-        callbacks = setup_callbacks(cfg.callbacks) + [LearningRateMonitor(logging_interval="step")]
+        msillm_info = get_msillm_identifier(cfg)
+        callbacks = setup_callbacks(cfg.callbacks, msillm_info=msillm_info) + [LearningRateMonitor(logging_interval="step")]
         
         # Set unique working directory for each seed
         work_dir = Path.cwd() / f"seed_{cfg.seed}"
