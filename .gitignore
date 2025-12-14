@@ -124,6 +124,8 @@ __pypackages__/
 celerybeat-schedule
 celerybeat.pid
 saved_models/
+# Checkpoint files (PyTorch Lightning)
+*.ckpt
 # SageMath parsed files
 *.sage.py
 
