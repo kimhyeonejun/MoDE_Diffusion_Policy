@@ -10,6 +10,9 @@ import numpy as np
 from omegaconf import OmegaConf
 import pyhash
 import torch
+import types
+from omegaconf import DictConfig
+from safetensors.torch import load_file
 from hydra.core.global_hydra import GlobalHydra
 
 from mode.utils.utils import add_text, format_sftp_path
@@ -198,6 +201,193 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
         module_path / checkpoint,
         overwrite_cfg=eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {},
     )
+    model.freeze()
+    model = model.cuda(device)
+    print("Successfully loaded model.")
+
+    return model, env, data_module, lang_embeddings
+
+# Helper functions for MS-ILLM
+def extract_compression_modules(compression_model: torch.nn.Module):
+    encoder = getattr(compression_model, "encoder", None)
+    decoder = getattr(compression_model, "decoder", None)
+    if encoder is None and hasattr(compression_model, "encode"):
+        encoder = compression_model
+    return encoder, decoder
+
+def load_msillm_from_torchhub(cfg: DictConfig):
+    if "msillm" not in cfg:
+        return None, None
+
+    ms_cfg = cfg.msillm
+    hub_repo = ms_cfg.get("hub_repo", "facebookresearch/NeuralCompression:v0.3.1")
+    entrypoint = ms_cfg.get("entrypoint", "msillm_quality_1")
+    pretrained = bool(ms_cfg.get("pretrained", True))
+
+    try:
+        msillm_model = torch.hub.load(hub_repo, entrypoint, pretrained=pretrained, verbose=False)
+    except TypeError:
+        msillm_model = torch.hub.load(hub_repo, entrypoint, pretrained=pretrained)
+
+    _enc, dec = extract_compression_modules(msillm_model)
+    return msillm_model, dec
+
+def _clip_mean_std(device: torch.device, dtype: torch.dtype):
+    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device, dtype=dtype).view(1, 1, 3, 1, 1)
+    std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device, dtype=dtype).view(1, 1, 3, 1, 1)
+    return mean, std
+
+def patch_modeagent_embed_visual_obs_for_msillm(model):
+    msillm = getattr(model, "msillm_model", None)
+    if msillm is None:
+        return None
+
+    encoder = getattr(msillm, "encoder", None)
+    decoder = getattr(msillm, "decoder", None)
+    if encoder is None or decoder is None:
+        return None
+
+    encoder.eval()
+    decoder.eval()
+
+    orig = getattr(model, "embed_visual_obs", None)
+    if orig is None or not callable(orig):
+        return None
+
+    def _reconstruct_normed(x_norm: torch.Tensor) -> torch.Tensor:
+        mean, std = _clip_mean_std(x_norm.device, x_norm.dtype)
+        x01 = (x_norm * std + mean).clamp(0.0, 1.0)
+
+        b, t, c, h, w = x01.shape
+        x01_bt = x01.reshape(b * t, c, h, w)
+
+        with torch.no_grad():
+            z = encoder(x01_bt)
+            recon = decoder(z)
+        
+        if recon.shape != x01_bt.shape and recon.numel() == x01_bt.numel():
+            recon = recon.view_as(x01_bt)
+        recon = recon.clamp(0.0, 1.0)
+
+        recon = recon.reshape(b, t, c, h, w)
+        out = (recon - mean) / std
+        return out
+
+    def _patched(self, rgb_static, rgb_gripper, latent_goal):
+        rgb_static = _reconstruct_normed(rgb_static)
+        rgb_gripper = _reconstruct_normed(rgb_gripper)
+        return orig(rgb_static, rgb_gripper, latent_goal)
+
+    model.embed_visual_obs = types.MethodType(_patched, model)
+    return decoder
+
+def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
+    # Resolve checkpoint path (handle both file and dir)
+    train_folder_path = Path(train_folder).expanduser()
+    ckpt_path = train_folder_path / checkpoint
+    
+    # Locate config
+    train_cfg_path = None
+    if ckpt_path.is_file():
+        # Check standard locations relative to file
+        if (ckpt_path.parent / ".hydra/config.yaml").exists():
+            train_cfg_path = ckpt_path.parent / ".hydra/config.yaml"
+        elif (train_folder_path / ".hydra/config.yaml").exists():
+            train_cfg_path = train_folder_path / ".hydra/config.yaml"
+    
+    if train_cfg_path is None:
+        # Fallback to assumption that checkpoint is a directory (or config is inside it)
+        train_cfg_path = ckpt_path / ".hydra/config.yaml"
+
+    train_cfg_path = format_sftp_path(train_cfg_path)
+    print(f"Loading config from {train_cfg_path}")
+    def_cfg = OmegaConf.load(train_cfg_path)
+    eval_override_cfg = OmegaConf.create(eval_cfg_overwrite)
+    cfg = OmegaConf.merge(def_cfg, eval_override_cfg)
+    lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
+    if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+        hydra.initialize("../../conf/datamodule/datasets")
+    # we don't want to use shm dataset for evaluation
+    # GlobalHydra.instance().clear()
+    # datasets_cfg = hydra.initialize("datamodule/datasets/vision_lang.yaml")
+    # since we don't use the trainer during inference, manually set up data_module
+    # cfg.datamodule.datasets = datasets_cfg
+    if device_id != 'cpu':
+        device = torch.device(f"cuda:{device_id}")
+    else:
+        device = 'cpu'
+    cfg.datamodule.root_data_dir = dataset_path
+    data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
+    if prep_dm_and_deps:
+        data_module.prepare_data()
+        data_module.setup()
+        dataloader = data_module.val_dataloader()
+        dataset = dataloader["lang"].dataset
+
+        if lang_embeddings is None:
+            lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
+
+        if env is None:
+            rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
+            env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
+
+
+    # MS-ILLM Loading Logic
+    module_path = (Path(train_folder).expanduser())
+    ckpt_path = module_path / checkpoint
+    print(f"Loading model from {ckpt_path}")
+
+    # 1. Instantiate model (config without ckpt_path)
+    model_cfg = cfg.model
+    # Remove ckpt_path if present to prevent premature loading
+    if "ckpt_path" in model_cfg:
+        del model_cfg["ckpt_path"]
+        
+    model = hydra.utils.instantiate(model_cfg)
+
+    # 2. Setup MS-ILLM
+    msillm_model, _ = load_msillm_from_torchhub(cfg)
+    if msillm_model is not None:
+        setattr(model, "msillm_model", msillm_model)
+        print("Attached MS-ILLM model")
+
+    # 3. Load Weights
+    # Determine the weight file
+    weight_file = None
+    if ckpt_path.is_file():
+        weight_file = ckpt_path
+    elif ckpt_path.is_dir():
+        # Look for typical weight files
+        potential_files = [
+            ckpt_path / "model.safetensors",
+            ckpt_path / "model_cleaned.safetensors",
+        ]
+        # Also check for .ckpt if no safetensors
+        potential_files.extend(list(ckpt_path.glob("*.ckpt")))
+        
+        for p in potential_files:
+            if p.exists():
+                weight_file = p
+                break
+    
+    if weight_file is None or not weight_file.exists():
+        # Fallback for when ckpt_path itself doesn't exist yet but might be a future path? 
+        # But we are loading.
+        raise FileNotFoundError(f"Could not find model weights in {ckpt_path}")
+    
+    print(f"Loading weights from {weight_file}")
+    if weight_file.suffix == ".safetensors":
+        state_dict = load_file(weight_file)
+        model.load_state_dict(state_dict, strict=False)
+    else:
+        sd = torch.load(weight_file)
+        if "state_dict" in sd:
+            sd = sd["state_dict"]
+        model.load_state_dict(sd, strict=False)
+
+    # 4. Patch MS-ILLM forward
+    patch_modeagent_embed_visual_obs_for_msillm(model)
+
     model.freeze()
     model = model.cuda(device)
     print("Successfully loaded model.")
