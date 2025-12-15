@@ -565,78 +565,83 @@ def run_image_compression_phase(cfg: DictConfig, base_work_dir: Path) -> Tuple[O
     Optional Phase 1 training: train or load the image compression module.
     Expects an `image_compression` section in the Hydra config.
     """
-    if "image_compression" not in cfg:
-        return None, None
+    pass
+#     # Phase 1 is disabled per request. Keep stub for clarity.
+#     log_rank_0("Phase 1 (image compression) is disabled; skipping.")
+#     return None, None
 
-    comp_cfg = cfg.image_compression
-    log_rank_0("Starting Phase 1: Image Compression Module")
+#     if "image_compression" not in cfg:
+#         return None, None
 
-    datamodule_cfg = comp_cfg.datamodule if "datamodule" in comp_cfg else cfg.datamodule
-    trainer_cfg = comp_cfg.trainer if "trainer" in comp_cfg else cfg.trainer
+#     comp_cfg = cfg.image_compression
+#     log_rank_0("Starting Phase 1: Image Compression Module")
 
-    comp_datamodule = hydra.utils.instantiate(datamodule_cfg)
-    comp_model = hydra.utils.instantiate(comp_cfg.model)
+#     datamodule_cfg = comp_cfg.datamodule if "datamodule" in comp_cfg else cfg.datamodule
+#     trainer_cfg = comp_cfg.trainer if "trainer" in comp_cfg else cfg.trainer
 
-    # region agent log
-    _agent_log(
-        runId="pre-fix",
-        hypothesisId="A",
-        location="mode/training_libero_msillm.py:run_image_compression_phase",
-        message="Phase1 compression model instantiated",
-        data={
-            "comp_model_type": type(comp_model).__name__,
-            "comp_model_total_params": _count_params(comp_model)[0],
-            "comp_model_trainable_params": _count_params(comp_model)[1],
-        },
-    )
-    # endregion
+#     comp_datamodule = hydra.utils.instantiate(datamodule_cfg)
+#     comp_model = hydra.utils.instantiate(comp_cfg.model)
 
-    # Train only decoder for the image compression model
-    decoder = _freeze_compression_encoder_only_train_decoder(comp_model)
+#     # region agent log
+#     _agent_log(
+#         runId="pre-fix",
+#         hypothesisId="A",
+#         location="mode/training_libero_msillm.py:run_image_compression_phase",
+#         message="Phase1 compression model instantiated",
+#         data={
+#             "comp_model_type": type(comp_model).__name__,
+#             "comp_model_total_params": _count_params(comp_model)[0],
+#             "comp_model_trainable_params": _count_params(comp_model)[1],
+#         },
+#     )
+#     # endregion
 
-    # region agent log
-    _agent_log(
-        runId="pre-fix",
-        hypothesisId="A",
-        location="mode/training_libero_msillm.py:run_image_compression_phase",
-        message="Phase1 compression model frozen except decoder",
-        data={
-            "decoder_found": decoder is not None,
-            "comp_model_trainable_params_after": _count_params(comp_model)[1],
-            "decoder_trainable_params": _count_params(decoder)[1] if decoder is not None else 0,
-            "decoder_trainable_param_names_head": _first_trainable_param_names(decoder, max_items=10),
-        },
-    )
-    # endregion
+#     # Train only decoder for the image compression model
+#     decoder = _freeze_compression_encoder_only_train_decoder(comp_model)
 
-    comp_logger = setup_logger(comp_cfg, comp_model) if "logger" in comp_cfg else setup_logger(cfg, comp_model)
-    callbacks_cfg = comp_cfg.callbacks if "callbacks" in comp_cfg else cfg.callbacks
-    comp_msillm_info = get_msillm_identifier(comp_cfg if "msillm" in comp_cfg else cfg)
-    comp_callbacks = setup_callbacks(callbacks_cfg, msillm_info=comp_msillm_info) + [LearningRateMonitor(logging_interval="step")]
+#     # region agent log
+#     _agent_log(
+#         runId="pre-fix",
+#         hypothesisId="A",
+#         location="mode/training_libero_msillm.py:run_image_compression_phase",
+#         message="Phase1 compression model frozen except decoder",
+#         data={
+#             "decoder_found": decoder is not None,
+#             "comp_model_trainable_params_after": _count_params(comp_model)[1],
+#             "decoder_trainable_params": _count_params(decoder)[1] if decoder is not None else 0,
+#             "decoder_trainable_param_names_head": _first_trainable_param_names(decoder, max_items=10),
+#         },
+#     )
+#     # endregion
 
-    work_dir = base_work_dir / "phase1_image_compression"
-    work_dir.mkdir(exist_ok=True)
+#     comp_logger = setup_logger(comp_cfg, comp_model) if "logger" in comp_cfg else setup_logger(cfg, comp_model)
+#     callbacks_cfg = comp_cfg.callbacks if "callbacks" in comp_cfg else cfg.callbacks
+#     comp_msillm_info = get_msillm_identifier(comp_cfg if "msillm" in comp_cfg else cfg)
+#     comp_callbacks = setup_callbacks(callbacks_cfg, msillm_info=comp_msillm_info) + [LearningRateMonitor(logging_interval="step")]
 
-    trainer_args = {
-        **{k: v for k, v in trainer_cfg.items()},
-        "logger": comp_logger,
-        "callbacks": comp_callbacks,
-        "default_root_dir": work_dir,
-        "accelerator": trainer_cfg.get("accelerator", "gpu"),
-        "devices": trainer_cfg.devices if "devices" in trainer_cfg else cfg.trainer.devices,
-        "strategy": "ddp_find_unused_parameters_true",
-    }
+#     work_dir = base_work_dir / "phase1_image_compression"
+#     work_dir.mkdir(exist_ok=True)
 
-    trainer = Trainer(**trainer_args)
-    trainer.fit(comp_model, datamodule=comp_datamodule)
+#     trainer_args = {
+#         **{k: v for k, v in trainer_cfg.items()},
+#         "logger": comp_logger,
+#         "callbacks": comp_callbacks,
+#         "default_root_dir": work_dir,
+#         "accelerator": trainer_cfg.get("accelerator", "gpu"),
+#         "devices": trainer_cfg.devices if "devices" in trainer_cfg else cfg.trainer.devices,
+#         "strategy": "ddp_find_unused_parameters_true",
+#     }
 
-    ckpt_path = None
-    if getattr(trainer, "checkpoint_callback", None) is not None:
-        ckpt_path = trainer.checkpoint_callback.best_model_path
-        log_rank_0(f"Phase 1 best checkpoint: {ckpt_path}")
+#     trainer = Trainer(**trainer_args)
+#     trainer.fit(comp_model, datamodule=comp_datamodule)
 
-    clear_cuda_cache()
-    return comp_model, ckpt_path
+#     ckpt_path = None
+#     if getattr(trainer, "checkpoint_callback", None) is not None:
+#         ckpt_path = trainer.checkpoint_callback.best_model_path
+#         log_rank_0(f"Phase 1 best checkpoint: {ckpt_path}")
+
+#     clear_cuda_cache()
+#     return comp_model, ckpt_path
 
 @hydra.main(config_path="../conf", config_name="config_libero_msillm")
 def train(cfg: DictConfig) -> None:
