@@ -1,3 +1,7 @@
+defaults:
+  - datamodule: libero
+  - model: mode_agent
+
 eval_cfg_overwrite:
   datamodule:
     datasets:
@@ -6,13 +10,12 @@ eval_cfg_overwrite:
   model:
     num_sampling_steps: 10
 
-train_folder: /home/yagmurlu/code/MoDE_Diffusion_Policy/pretrained/
-checkpoint: libero_90=0
-device: 0
+train_folder: /home/hjkim/MoDE_Diffusion_Policy/saved_models
+checkpoint: msillm-NeuralCompression_main-msillm_quality_vlo1_epoch19.ckpt
+device: 4
 
-
-log_dir: /home/yagmurlu/code/MoDE_Diffusion_Policy/outputs/libero_90_test
-dataset_path: /home/yagmurlu/code/mdt_policy/dataset/calvin_debug_dataset
+log_dir: /home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval
+dataset_path: /tmp
 num_videos: 30
 debug: False
 

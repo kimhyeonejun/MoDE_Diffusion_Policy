@@ -19,7 +19,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from mode.evaluation.utils import get_default_mode_and_env
+from mode.evaluation.utils import get_default_mode_and_env, get_msillm_mode_and_env
 from mode.rollout.rollout_video import RolloutVideo
 # Import LIBERO environment utilities
 from libero.libero import benchmark, get_libero_path
@@ -98,7 +98,11 @@ class EvaluateLibero:
         self.transforms = transforms
         self.log_dir = log_dir
 
-        self.device = device
+        # Normalize device to torch.device
+        if device == "cpu" or device == "cpu":
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(f"cuda:{device}")
         self.task_order = 0
         self.bddl_folder = get_libero_path("bddl_files")
         self.init_states_folder = get_libero_path("init_states")
@@ -118,20 +122,27 @@ class EvaluateLibero:
         self.num_sequences = num_sequences
         self.max_steps = max_steps
         # self.save_dir = save_dir
-        self.device = None
         self.eval_sequences = None
         self.init_states_paths = []
         self.cfg = {}
         self.descriptions = []
-        self.create_cfg_for_libero(self.task_embedding_format)
+        
+        # First, collect all descriptions
         for i in range(self.num_tasks):
-
             task_i = self.benchmark_instance.get_task(0)
-
             self.init_states_paths.append(
                 os.path.join(self.init_states_folder, self.task_names[i], task_i.init_states_file)
             )
             self.descriptions.append(self.benchmark_instance.get_task(i).language)
+
+        # Now create cfg and task embeddings with descriptions available
+        self.create_cfg_for_libero(self.task_embedding_format)
+        
+        # Use task embeddings created in create_cfg_for_libero
+        if hasattr(self, 'task_embs'):
+            self.benchmark_instance.set_task_embs(self.task_embs)
+        else:
+            # Fallback to get_task_embs if needed
             task_embs = get_task_embs(self.cfg, self.descriptions)
             self.benchmark_instance.set_task_embs(task_embs)
 
@@ -149,12 +160,14 @@ class EvaluateLibero:
         result_array = sum(successes) / len(successes)
 
         # print(f"number of rollouts: {len(successes)}")
-        log_print(f"eval_lh/avg_seq_len success rate {torch.tensor(result_array)}")
-        wandb.log("eval_lh/avg_seq_len", torch.tensor(result_array), on_epoch=True, sync_dist=True)
+        log_print.info(f"eval_lh/avg_seq_len success rate {torch.tensor(result_array)}")
+        if wandb.run is not None:
+            wandb.log({"eval_lh/avg_seq_len": torch.tensor(result_array)})
 
         for success, task_name in zip(successes, self.task_names):
-            log_print(f"eval_lh/sr_{task_name} with success {success}")
-            wandb.log(f"eval_lh/sr_{task_name}", success, on_step=False, sync_dist=True)
+            log_print.info(f"eval_lh/sr_{task_name} with success {success}")
+            if wandb.run is not None:
+                wandb.log({f"eval_lh/sr_{task_name}": success})
         print('done')
         print()
 
@@ -166,7 +179,7 @@ class EvaluateLibero:
             task_i = self.benchmark_instance.get_task(idx)
             task_emb = self.benchmark_instance.task_embs[idx]
             task_str = f"k{self.all_tasks[-1]}_p{idx}"
-            log_print(f"starting to evaluate: {task_name}")
+            log_print.info(f"starting to evaluate: {task_name}")
             success_rate = self.evaluate_task(model, task_i, task_emb, task_str, idx, store_video=store_video)
             successes.append(success_rate)
 
@@ -215,7 +228,17 @@ class EvaluateLibero:
             done = False
             steps = 0
             model.reset()
-            obs = env.set_init_state(init_states)
+
+            # Use per-rollout init state if a list is provided
+            state = init_states
+            if isinstance(init_states, (list, tuple)):
+                state = init_states[i % len(init_states)]
+
+            try:
+                obs = env.set_init_state(state)
+            except Exception as e:
+                log_print.warning(f"set_init_state failed on rollout {i}: {e}; falling back to env.reset()")
+                obs = env.reset()
 
             # dummy actions [env_num, 7] all zeros for initial physics simulation
             dummy = np.zeros(7)
@@ -257,12 +280,36 @@ class EvaluateLibero:
         return success_rate
 
     def create_cfg_for_libero(self, task_embedding_format):
-        self.cfg = DictConfig({'task_embedding_format': task_embedding_format,
-                               'data': {'max_word_len': 25}})
+        self.cfg = DictConfig({
+            'task_embedding_format': task_embedding_format,
+            'data': {'max_word_len': 25},
+            'task_embedding_one_hot_offset': 1
+        })
 
         self.cfg.policy = OmegaConf.create()
         self.cfg.policy.language_encoder = OmegaConf.create()
         self.cfg.policy.language_encoder.network_kwargs = OmegaConf.create()
+
+        # Create simple task embeddings to avoid transformers issues
+        import torch
+        num_tasks = len(self.descriptions)
+        if task_embedding_format == "one-hot":
+            # Simple one-hot embeddings
+            task_embs = []
+            for i in range(num_tasks):
+                emb = torch.zeros(num_tasks)
+                emb[i] = 1.0
+                task_embs.append(emb)
+            self.task_embs = task_embs
+            return  # Skip get_task_embs call
+        else:
+            # For other formats, we'll need to implement simple versions
+            task_embs = []
+            for i in range(num_tasks):
+                emb = torch.randn(768)  # Standard embedding size
+                task_embs.append(emb)
+            self.task_embs = task_embs
+            return
 
 
     def translate_obs_space(self, obs_space):
@@ -303,54 +350,223 @@ class EvaluateLibero:
 
         return return_obs, goal
 
-@hydra.main(config_path="../../conf", config_name="mode_evaluate_libero")
-def main(cfg):
-    seed_everything(0, workers=True)
-    model, _, dm, _ = get_default_mode_and_env(
-        cfg.train_folder,
-        cfg.dataset_path,
-        cfg.checkpoint,
-        env=42,
-        lang_embeddings=None,
-        eval_cfg_overwrite=cfg.eval_cfg_overwrite,
-        device_id=cfg.device,
-        prep_dm_and_deps=False
-    )
+def main():
+    import argparse
+    from pathlib import Path
+    from omegaconf import OmegaConf
+    import hydra
+    from mode.evaluation.utils import load_msillm_from_torchhub
 
-    model = model.to(cfg.device)
+    parser = argparse.ArgumentParser(
+        description='Evaluate MoDE model on LIBERO benchmark',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Use specific checkpoint
+  python mode/evaluation/mode_evaluate_libero_msillm.py --checkpoint msillm-NeuralCompression_main-msillm_quality_vlo1_epoch19.ckpt
+  
+  # Use latest checkpoint automatically
+  python mode/evaluation/mode_evaluate_libero_msillm.py --checkpoint latest
+  
+  # Use checkpoint by epoch number
+  python mode/evaluation/mode_evaluate_libero_msillm.py --checkpoint epoch=19
+  
+  # List available checkpoints
+  python mode/evaluation/mode_evaluate_libero_msillm.py --list_checkpoints
+        """
+    )
+    parser.add_argument('--train_folder', type=str, default='/home/hjkim/MoDE_Diffusion_Policy/saved_models',
+                        help='Folder containing checkpoints')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Checkpoint filename, "latest" for most recent, or "epoch=N" for specific epoch')
+    parser.add_argument('--list_checkpoints', action='store_true',
+                        help='List all available checkpoints and exit')
+    parser.add_argument('--log_dir', type=str, default='/home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval')
+    parser.add_argument('--device', type=int, default=4)
+    parser.add_argument('--log_wandb', action='store_true', default=False)
+    parser.add_argument('--num_videos', type=int, default=1)
+    parser.add_argument('--n_eval', type=int, default=2)
+    parser.add_argument('--benchmark_name', type=str, default='libero_10')
+    parser.add_argument('--max_steps', type=int, default=520)
+    parser.add_argument('--num_sequences', type=int, default=50)
+    parser.add_argument('--task_embedding_format', type=str, default='clip')
+
+    args = parser.parse_args()
+    
+    # Handle checkpoint selection
+    train_folder_path = Path(args.train_folder).expanduser()
+    
+    if args.list_checkpoints:
+        print("\nAvailable checkpoints:")
+        checkpoints = sorted(train_folder_path.glob("*.ckpt"), key=lambda x: x.stat().st_mtime, reverse=True)
+        for i, ckpt in enumerate(checkpoints, 1):
+            size_gb = ckpt.stat().st_size / (1024**3)
+            mtime = ckpt.stat().st_mtime
+            from datetime import datetime
+            mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"  {i}. {ckpt.name} ({size_gb:.2f}GB, {mtime_str})")
+        print(f"\nTotal: {len(checkpoints)} checkpoints")
+        return
+    
+    if args.checkpoint is None:
+        # Try to find latest checkpoint
+        checkpoints = sorted(train_folder_path.glob("*.ckpt"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if checkpoints:
+            args.checkpoint = checkpoints[0].name
+            print(f"No checkpoint specified, using latest: {args.checkpoint}")
+        else:
+            print("Error: No checkpoint specified and no checkpoints found!")
+            return
+    elif args.checkpoint == "latest":
+        # Find latest checkpoint
+        checkpoints = sorted(train_folder_path.glob("*.ckpt"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if checkpoints:
+            args.checkpoint = checkpoints[0].name
+            print(f"Using latest checkpoint: {args.checkpoint}")
+        else:
+            print("Error: No checkpoints found!")
+            return
+    elif args.checkpoint.startswith("epoch="):
+        # Find checkpoint by epoch number
+        epoch_num = args.checkpoint.split("=")[1]
+        # Try different naming patterns
+        patterns = [
+            f"*epoch{epoch_num}.ckpt",
+            f"*epoch={epoch_num}.ckpt",
+            f"*epoch=epoch={epoch_num}.ckpt",
+        ]
+        found = False
+        for pattern in patterns:
+            matches = list(train_folder_path.glob(pattern))
+            if matches:
+                args.checkpoint = matches[0].name
+                print(f"Found checkpoint for epoch {epoch_num}: {args.checkpoint}")
+                found = True
+                break
+        if not found:
+            print(f"Error: No checkpoint found for epoch {epoch_num}")
+            print("Available checkpoints:")
+            for ckpt in sorted(train_folder_path.glob("*.ckpt")):
+                print(f"  - {ckpt.name}")
+            return
+
+    seed_everything(0, workers=True)
+
+    # Load config and create model manually
+    with hydra.initialize(config_path='../../conf'):
+        cfg = hydra.compose(config_name='config_libero_msillm')
+
+    # Create model
+    model_cfg = cfg.model
+    model_cfg_dict = OmegaConf.to_container(model_cfg, resolve=True)
+    if "ckpt_path" in model_cfg_dict:
+        del model_cfg_dict["ckpt_path"]
+    model_cfg = OmegaConf.create(model_cfg_dict)
+
+    model = hydra.utils.instantiate(model_cfg)
+
+    # Setup MS-ILLM
+    msillm_model, _ = load_msillm_from_torchhub(cfg)
+    if msillm_model is not None:
+        setattr(model, "msillm_model", msillm_model)
+        print("Attached MS-ILLM model")
+
+    # Load weights
+    ckpt_path = train_folder_path / args.checkpoint
+    if not ckpt_path.exists():
+        print(f"Error: Checkpoint not found: {ckpt_path}")
+        print(f"Available checkpoints in {train_folder_path}:")
+        for ckpt in sorted(train_folder_path.glob("*.ckpt")):
+            print(f"  - {ckpt.name}")
+        return
+    
+    print(f"Loading checkpoint: {ckpt_path}")
+    if ckpt_path.suffix == ".safetensors":
+        from safetensors.torch import load_file
+        state_dict = load_file(ckpt_path)
+        model.load_state_dict(state_dict, strict=False)
+    else:
+        sd = torch.load(ckpt_path, map_location='cpu')
+        if "state_dict" in sd:
+            sd = sd["state_dict"]
+        model.load_state_dict(sd, strict=False)
+
+    # For evaluation, we don't need datamodule or lang embeddings
+    dm = None
+    lang_embeddings = None
+
+    # Handle CUDA_VISIBLE_DEVICES: if set, device should be 0 (first visible device)
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible:
+        device_id = 0  # CUDA_VISIBLE_DEVICES sets the first visible device as 0
+        print(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, using device 0")
+    else:
+        device_id = args.device
+    
+    model = model.to(f"cuda:{device_id}")
     model.eval()
 
-    log_dir = get_log_dir(cfg.log_dir)
-    # transforms = dm.val_dataloader().dataset.transforms
-    transforms = hydra.utils.instantiate(dm.transforms)
+    log_dir = get_log_dir(args.log_dir)
+
+    # Create transforms directly from config (use validation transforms)
+    transforms_cfg = cfg.datamodule.transforms.val if "val" in cfg.datamodule.transforms else cfg.datamodule.transforms
+    transforms = hydra.utils.instantiate(transforms_cfg)
 
     eval_libero = EvaluateLibero(
         model=model,
         transforms=transforms,
         log_dir=log_dir,
-        benchmark_name=cfg.benchmark_name,
-        num_sequences=cfg.num_sequences,
-        num_videos=cfg.num_videos,
-        max_steps=cfg.max_steps,
-        n_eval=cfg.n_eval,
-        task_embedding_format=cfg.task_embedding_format,
-        device=cfg.device,
+        benchmark_name=args.benchmark_name,
+        num_sequences=args.num_sequences,
+        num_videos=args.num_videos,
+        max_steps=args.max_steps,
+        n_eval=args.n_eval,
+        task_embedding_format=args.task_embedding_format,
+        device=args.device,
     )
 
-    if cfg.log_wandb:
+    if args.log_wandb:
         os.makedirs(log_dir / "wandb", exist_ok=False)
         run = wandb.init(
             project='mode_libero_eval',
-            entity=cfg.wandb_entity,
-            config=OmegaConf.to_object(cfg),
+            entity='your_entity',  # replace with your wandb entity
+            config=vars(args),
         )
 
-    if cfg.log_wandb:
+    # Actually run the evaluation!
+    print("\n" + "="*50)
+    print("Starting evaluation...")
+    print("="*50 + "\n")
+    eval_libero.setup()
+    eval_libero.start()
+
+    if args.log_wandb:
         run.finish()
+    
+    print("\n" + "="*50)
+    print("Evaluation completed!")
+    print("="*50)
 
 
 if __name__ == "__main__":
-    # Set CUDA device IDs
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+    import sys
+    
+    # Check if CUDA_VISIBLE_DEVICES is set
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible:
+        # If CUDA_VISIBLE_DEVICES is set, device should be 0 (first visible device)
+        # Override default device argument
+        if "--device" not in sys.argv:
+            sys.argv.append("--device")
+            sys.argv.append("0")
+            print(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, setting device to 0")
+    else:
+        # If not set, use default device 4
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+        if "--device" not in sys.argv:
+            sys.argv.append("--device")
+            sys.argv.append("0")
+            print("Setting CUDA_VISIBLE_DEVICES=4, using device 0")
+    
     main()

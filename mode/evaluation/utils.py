@@ -301,7 +301,17 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
 
     train_cfg_path = format_sftp_path(train_cfg_path)
     print(f"Loading config from {train_cfg_path}")
-    def_cfg = OmegaConf.load(train_cfg_path)
+
+    # For evaluation, use the main config instead of training config
+    if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+        hydra.initialize("../../conf")
+
+    try:
+        def_cfg = hydra.compose(config_name="config_libero_msillm")
+    except:
+        # Fallback to loading training config
+        def_cfg = OmegaConf.load(train_cfg_path)
+
     eval_override_cfg = OmegaConf.create(eval_cfg_overwrite)
     cfg = OmegaConf.merge(def_cfg, eval_override_cfg)
     lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
@@ -340,8 +350,10 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
     # 1. Instantiate model (config without ckpt_path)
     model_cfg = cfg.model
     # Remove ckpt_path if present to prevent premature loading
-    if "ckpt_path" in model_cfg:
-        del model_cfg["ckpt_path"]
+    model_cfg_dict = OmegaConf.to_container(model_cfg, resolve=True)
+    if "ckpt_path" in model_cfg_dict:
+        del model_cfg_dict["ckpt_path"]
+    model_cfg = OmegaConf.create(model_cfg_dict)
         
     model = hydra.utils.instantiate(model_cfg)
 
@@ -380,7 +392,7 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
         state_dict = load_file(weight_file)
         model.load_state_dict(state_dict, strict=False)
     else:
-        sd = torch.load(weight_file)
+        sd = torch.load(weight_file, map_location='cpu')
         if "state_dict" in sd:
             sd = sd["state_dict"]
         model.load_state_dict(sd, strict=False)

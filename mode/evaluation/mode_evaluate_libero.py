@@ -345,9 +345,19 @@ def main(cfg):
             config=OmegaConf.to_object(cfg),
         )
 
+    # Actually run the evaluation!
+    print("\n" + "="*50)
+    print("Starting evaluation...")
+    print("="*50 + "\n")
+    eval_libero.setup()
+    eval_libero.start()
+
     if cfg.log_wandb:
         run.finish()
-
+    
+    print("\n" + "="*50)
+    print("Evaluation completed!")
+    print("="*50)
 
 if __name__ == "__main__":
     # Set CUDA device IDs

@@ -51,6 +51,12 @@ msillm:
   entrypoint: msillm_quality_vlo1
   pretrained: true
 
+# Training configuration: which modules to train/freeze
+# Set to True to train, False to freeze
+train_vision_encoders: true   # Train static_resnet and gripper_resnet (default: true)
+train_msillm_encoder: false   # Train MS-ILLM encoder (default: false)
+train_msillm_decoder: true    # Train MS-ILLM decoder (default: true)
+
 # Override checkpoint callback for MS-ILLM training
 # Since rollout_lh callback is disabled, eval_lh/avg_seq_len is not available
 # Use val_act/lang_act_loss_pp instead for monitoring

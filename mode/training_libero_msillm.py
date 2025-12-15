@@ -236,6 +236,39 @@ def get_msillm_identifier(cfg: DictConfig) -> str:
     entrypoint = entrypoint.replace("/", "_").replace(":", "_")
     return f"msillm-{repo_name}-{entrypoint}"
 
+def extract_msillm_identifier_from_checkpoint_path(checkpoint_path: Path) -> Optional[str]:
+    """
+    Extract MS-ILLM identifier from checkpoint filename.
+    
+    Examples:
+        "msillm-NeuralCompression_v0.3.1-msillm_quality_1_epoch19.ckpt" -> "msillm-NeuralCompression_v0.3.1-msillm_quality_1"
+        "msillm-NeuralCompression_main-msillm_quality_vlo1_epoch=epoch=21.ckpt" -> "msillm-NeuralCompression_main-msillm_quality_vlo1"
+    
+    Returns:
+        MS-ILLM identifier string or None if not found.
+    """
+    filename = checkpoint_path.stem  # Get filename without extension
+    # Pattern: msillm-<repo>-<entrypoint>_<rest>
+    if filename.startswith("msillm-"):
+        # Find the pattern: msillm-<repo>-<entrypoint>_<rest>
+        # Split by underscore and find where epoch or other patterns start
+        parts = filename.split("_")
+        # Look for "epoch" or "epoch=" pattern to find where identifier ends
+        identifier_parts = []
+        for part in parts:
+            if part.startswith("epoch"):
+                break
+            identifier_parts.append(part)
+        
+        if identifier_parts:
+            # Reconstruct identifier (e.g., "msillm-NeuralCompression_v0.3.1-msillm_quality_1")
+            identifier = "_".join(identifier_parts)
+            # Handle case where entrypoint itself contains underscores (e.g., msillm_quality_vlo1)
+            # The identifier should end before "epoch" or similar patterns
+            return identifier
+    
+    return None
+
 def setup_callbacks(callbacks_cfg: DictConfig, msillm_info: str = "") -> list[Callback]:
     result = []
     for cb_name, cb_cfg in callbacks_cfg.items():
@@ -612,6 +645,8 @@ def train(cfg: DictConfig) -> None:
         os.environ['HYDRA_FULL_ERROR'] = '1'
         # Set memory allocation configuration
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+        # Fix for PyTorch 2.6+ weights_only issue: force weights_only=False for checkpoint loading
+        os.environ['TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD'] = '1'
         
         seed_everything(cfg.seed, workers=True)
         torch.set_float32_matmul_precision('medium')
@@ -665,7 +700,22 @@ def train(cfg: DictConfig) -> None:
                 setattr(model, "msillm_model", msillm_model)
         else:
             # Load model from checkpoint (this should include msillm_model if it was saved)
-            model = getattr(models_m, cfg.model["_target_"].split(".")[-1]).load_from_checkpoint(last_checkpoint.as_posix())
+            # First, initialize model and attach MS-ILLM if configured, then load checkpoint
+            # This ensures msillm_model structure exists before loading checkpoint
+            model = hydra.utils.instantiate(cfg.model)
+            msillm_model, _msillm_decoder = load_msillm_from_torchhub(cfg)
+            if msillm_model is not None:
+                setattr(model, "msillm_model", msillm_model)
+            
+            # Now load checkpoint with strict=False to handle any missing/extra keys gracefully
+            checkpoint = torch.load(last_checkpoint.as_posix(), map_location='cpu', weights_only=False)
+            model.load_state_dict(checkpoint['state_dict'], strict=False)
+            
+            # Restore epoch and step info if needed
+            if 'epoch' in checkpoint:
+                log_rank_0(f"Checkpoint epoch: {checkpoint['epoch']}")
+            if 'global_step' in checkpoint:
+                log_rank_0(f"Checkpoint global_step: {checkpoint['global_step']}")
             # Check if msillm_model was loaded from checkpoint
             if hasattr(model, "msillm_model") and model.msillm_model is not None:
                 log_rank_0("MS-ILLM model loaded from checkpoint")
@@ -713,14 +763,41 @@ def train(cfg: DictConfig) -> None:
             else:
                 log_rank_0("⚠ WARNING: No MS-ILLM weights found in model.state_dict()!")
         
-        # Train only vision encoders (static/gripper resnets) for the policy
-        _freeze_all_except_vision_encoders(model)
+        # Configure which modules to train/freeze based on config
+        # Default: train only vision encoders and MS-ILLM decoder
+        train_vision_encoders = cfg.get("train_vision_encoders", True)
+        train_msillm_encoder = cfg.get("train_msillm_encoder", False)
+        train_msillm_decoder = cfg.get("train_msillm_decoder", True)
+        
+        # Freeze/unfreeze vision encoders
+        if train_vision_encoders:
+            # Train only vision encoders (static/gripper resnets)
+            _freeze_all_except_vision_encoders(model)
+            log_rank_0("Vision encoders (static_resnet, gripper_resnet) are trainable")
+        else:
+            # Freeze everything including vision encoders
+            _set_requires_grad(model, False)
+            log_rank_0("All model parameters are frozen (including vision encoders)")
 
-        # If MS-ILLM is present, train ONLY its decoder alongside the vision encoders.
+        # Configure MS-ILLM encoder/decoder training
         compression_decoder = None
         if msillm_model is not None:
-            compression_decoder = _freeze_compression_encoder_only_train_decoder(msillm_model)
-            _patch_optimizer_to_only_train_selected(model, extra_trainable_module=compression_decoder)
+            encoder, decoder = extract_compression_modules(msillm_model)
+            
+            # Freeze/unfreeze MS-ILLM encoder
+            if encoder is not None:
+                _set_requires_grad(encoder, train_msillm_encoder)
+                log_rank_0(f"MS-ILLM encoder: {'trainable' if train_msillm_encoder else 'frozen'}")
+            
+            # Freeze/unfreeze MS-ILLM decoder
+            if decoder is not None:
+                _set_requires_grad(decoder, train_msillm_decoder)
+                compression_decoder = decoder if train_msillm_decoder else None
+                log_rank_0(f"MS-ILLM decoder: {'trainable' if train_msillm_decoder else 'frozen'}")
+            
+            # If decoder is trainable, add it to optimizer
+            if compression_decoder is not None:
+                _patch_optimizer_to_only_train_selected(model, extra_trainable_module=compression_decoder)
 
         # Patch embed_visual_obs to route images through MS-ILLM encoder(no_grad)/decoder(grad) in forward.
         patch_modeagent_embed_visual_obs_for_msillm(model)
@@ -757,7 +834,17 @@ def train(cfg: DictConfig) -> None:
             
         # Setup training
         train_logger = setup_logger(cfg, model)
+        
+        # Determine MS-ILLM identifier: use checkpoint's identifier if resuming, otherwise use config
         msillm_info = get_msillm_identifier(cfg)
+        if last_checkpoint is not None:
+            checkpoint_msillm_info = extract_msillm_identifier_from_checkpoint_path(last_checkpoint)
+            if checkpoint_msillm_info:
+                msillm_info = checkpoint_msillm_info
+                log_rank_0(f"Using MS-ILLM identifier from checkpoint: {msillm_info}")
+            else:
+                log_rank_0(f"Could not extract MS-ILLM identifier from checkpoint, using config: {msillm_info}")
+        
         callbacks = setup_callbacks(cfg.callbacks, msillm_info=msillm_info) + [LearningRateMonitor(logging_interval="step")]
         
         # Set unique working directory for each seed
