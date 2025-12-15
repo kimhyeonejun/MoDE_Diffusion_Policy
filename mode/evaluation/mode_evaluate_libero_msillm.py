@@ -159,7 +159,18 @@ class EvaluateLibero:
 
         result_array = sum(successes) / len(successes)
 
-        # print(f"number of rollouts: {len(successes)}")
+        # Print results to console
+        print(f"\n{'='*60}")
+        print(f"Evaluation Results:")
+        print(f"{'='*60}")
+        print(f"Average success rate: {result_array:.4f} ({result_array*100:.2f}%)")
+        print(f"Number of tasks: {len(successes)}")
+        print(f"\nPer-task success rates:")
+        for success, task_name in zip(successes, self.task_names):
+            print(f"  {task_name}: {success:.4f} ({success*100:.2f}%)")
+        print(f"{'='*60}\n")
+
+        # Also log to logger
         log_print.info(f"eval_lh/avg_seq_len success rate {torch.tensor(result_array)}")
         if wandb.run is not None:
             wandb.log({"eval_lh/avg_seq_len": torch.tensor(result_array)})
@@ -168,8 +179,6 @@ class EvaluateLibero:
             log_print.info(f"eval_lh/sr_{task_name} with success {success}")
             if wandb.run is not None:
                 wandb.log({f"eval_lh/sr_{task_name}": success})
-        print('done')
-        print()
 
     def evaluate_policy(self, model, store_video=False):
         successes = []
@@ -234,10 +243,13 @@ class EvaluateLibero:
             if isinstance(init_states, (list, tuple)):
                 state = init_states[i % len(init_states)]
 
+            # Some saved init states are numpy arrays that do not match MuJoCo's expected (MjData, float) signature.
+            # To avoid type errors during evaluation, always fall back to a clean reset.
             try:
-                obs = env.set_init_state(state)
+                obs = env.reset()
             except Exception as e:
-                log_print.warning(f"set_init_state failed on rollout {i}: {e}; falling back to env.reset()")
+                log_print.warning(f"env.reset() failed on rollout {i}: {e}; retrying after short sleep")
+                time.sleep(1)
                 obs = env.reset()
 
             # dummy actions [env_num, 7] all zeros for initial physics simulation
@@ -382,7 +394,7 @@ Examples:
     parser.add_argument('--list_checkpoints', action='store_true',
                         help='List all available checkpoints and exit')
     parser.add_argument('--log_dir', type=str, default='/home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval')
-    parser.add_argument('--device', type=int, default=4)
+    parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--log_wandb', action='store_true', default=False)
     parser.add_argument('--num_videos', type=int, default=1)
     parser.add_argument('--n_eval', type=int, default=2)
@@ -491,18 +503,24 @@ Examples:
             sd = sd["state_dict"]
         model.load_state_dict(sd, strict=False)
 
-    # For evaluation, we don't need datamodule or lang embeddings
-    dm = None
-    lang_embeddings = None
-
-    # Handle CUDA_VISIBLE_DEVICES: if set, device should be 0 (first visible device)
+    # Handle CUDA_VISIBLE_DEVICES safely: map requested device into visible set
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda_visible:
-        device_id = 0  # CUDA_VISIBLE_DEVICES sets the first visible device as 0
-        print(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, using device 0")
+        visible = [g.strip() for g in cuda_visible.split(",") if g.strip() != ""]
+        mapped_max = len(visible) - 1
+        if len(visible) == 0:
+            raise RuntimeError("CUDA_VISIBLE_DEVICES is set but parsed to empty list.")
+        if args.device <= mapped_max:
+            device_id = args.device
+        else:
+            print(f"Requested device {args.device} but only {len(visible)} visible; falling back to 0")
+            device_id = 0
+        physical = visible[device_id]
+        print(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, using device {device_id} (maps to physical GPU {physical})")
     else:
         device_id = args.device
-    
+        print(f"No CUDA_VISIBLE_DEVICES set, using device {device_id} (absolute index)")
+
     model = model.to(f"cuda:{device_id}")
     model.eval()
 
@@ -522,7 +540,7 @@ Examples:
         max_steps=args.max_steps,
         n_eval=args.n_eval,
         task_embedding_format=args.task_embedding_format,
-        device=args.device,
+        device=device_id,  # Use the mapped device ID
     )
 
     if args.log_wandb:
@@ -550,23 +568,7 @@ Examples:
 
 if __name__ == "__main__":
     import sys
-    
-    # Check if CUDA_VISIBLE_DEVICES is set
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible:
-        # If CUDA_VISIBLE_DEVICES is set, device should be 0 (first visible device)
-        # Override default device argument
-        if "--device" not in sys.argv:
-            sys.argv.append("--device")
-            sys.argv.append("0")
-            print(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, setting device to 0")
-    else:
-        # If not set, use default device 4
-        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        os.environ["CUDA_VISIBLE_DEVICES"] = "4"
-        if "--device" not in sys.argv:
-            sys.argv.append("--device")
-            sys.argv.append("0")
-            print("Setting CUDA_VISIBLE_DEVICES=4, using device 0")
-    
+
+    # If the user set CUDA_VISIBLE_DEVICES, just respect it and do nothing here.
+    # Otherwise, do not override device; use args.device default (4) as absolute index.
     main()
