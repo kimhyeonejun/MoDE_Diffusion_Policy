@@ -625,6 +625,8 @@ def train(cfg: DictConfig) -> None:
         datamodule = hydra.utils.instantiate(cfg.datamodule)
 
         # Check if we're resuming from checkpoint
+        # Note: We load model weights manually here to handle MS-ILLM submodule,
+        # but also pass ckpt_path to Trainer.fit() to restore optimizer/scheduler state
         last_checkpoint = get_last_checkpoint(Path.cwd())
         if last_checkpoint is None:
             model = hydra.utils.instantiate(cfg.model)
@@ -764,8 +766,14 @@ def train(cfg: DictConfig) -> None:
         # Initialize trainer and train
         trainer = Trainer(**trainer_args)
         
+        # Resume from checkpoint if available (for full resume including optimizer/scheduler state)
+        fit_kwargs = {}
+        if last_checkpoint is not None:
+            fit_kwargs["ckpt_path"] = last_checkpoint.as_posix()
+            log_rank_0(f"Resuming training from checkpoint: {last_checkpoint}")
+        
         try:
-            trainer.fit(model, datamodule=datamodule)
+            trainer.fit(model, datamodule=datamodule, **fit_kwargs)
         except Exception as e:
             log_rank_0("\nDetailed Error Information:")
             log_rank_0("=" * 80)
