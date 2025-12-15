@@ -21,6 +21,42 @@ hasher = pyhash.fnv1_32()
 logger = logging.getLogger(__name__)
 
 
+def get_device(device_id):
+    """
+    Convert device_id to torch.device.
+    
+    Args:
+        device_id: int (GPU index), 'cpu', or torch.device
+        
+    Returns:
+        torch.device: The device object
+    """
+    if isinstance(device_id, torch.device):
+        return device_id
+    elif device_id == 'cpu':
+        return torch.device('cpu')
+    else:
+        return torch.device(f"cuda:{device_id}")
+
+
+def move_model_to_device(model, device):
+    """
+    Move model to specified device.
+    
+    Args:
+        model: PyTorch model
+        device: torch.device or device_id (int/'cpu')
+        
+    Returns:
+        model: Model moved to device
+    """
+    device = get_device(device)
+    if device.type == 'cuda':
+        return model.cuda(device)
+    else:
+        return model.to(device)
+
+
 def load_class(name):
     module_name, class_name = name.rsplit(".", 1)
     module = importlib.import_module(module_name)
@@ -127,7 +163,7 @@ def get_default_model_and_env(train_folder, dataset_path, checkpoint, env=None, 
     data_module.setup()
     dataloader = data_module.val_dataloader()
     dataset = dataloader.dataset.datasets["lang"]
-    device = torch.device(f"cuda:{device_id}")
+    device = get_device(device_id)
 
     if lang_embeddings is None:
         lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
@@ -152,7 +188,7 @@ def get_default_model_and_env(train_folder, dataset_path, checkpoint, env=None, 
     model.freeze()
     if cfg.model.action_decoder.get("load_action_bounds", False):
         model.action_decoder._setup_action_bounds(cfg.datamodule.root_data_dir, None, None, True)
-    model = model.cuda(device)
+    model = move_model_to_device(model, device)
     print("Successfully loaded model.")
 
     return model, env, data_module, lang_embeddings
@@ -172,10 +208,7 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
     # datasets_cfg = hydra.initialize("datamodule/datasets/vision_lang.yaml")
     # since we don't use the trainer during inference, manually set up data_module
     # cfg.datamodule.datasets = datasets_cfg
-    if device_id != 'cpu':
-        device = torch.device(f"cuda:{device_id}")
-    else:
-        device = 'cpu'
+    device = get_device(device_id)
     cfg.datamodule.root_data_dir = dataset_path
     data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
     if prep_dm_and_deps:
@@ -202,7 +235,7 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
         overwrite_cfg=eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {},
     )
     model.freeze()
-    model = model.cuda(device)
+    model = move_model_to_device(model, device)
     print("Successfully loaded model.")
 
     return model, env, data_module, lang_embeddings
@@ -314,7 +347,24 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
 
     eval_override_cfg = OmegaConf.create(eval_cfg_overwrite)
     cfg = OmegaConf.merge(def_cfg, eval_override_cfg)
-    lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
+    
+    # Safely get lang_folder with fallback
+    try:
+        lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
+    except (AttributeError, KeyError):
+        # Fallback to default if not in config
+        lang_folder = "lang_annotations"
+        # Temporarily disable struct mode to set the value
+        was_struct = OmegaConf.is_struct(cfg.datamodule.datasets.lang_dataset) if hasattr(cfg.datamodule.datasets, 'lang_dataset') else False
+        if was_struct:
+            OmegaConf.set_struct(cfg.datamodule.datasets.lang_dataset, False)
+        # Set it in config for consistency
+        if not hasattr(cfg.datamodule.datasets, 'lang_dataset') or cfg.datamodule.datasets.lang_dataset is None:
+            cfg.datamodule.datasets.lang_dataset = OmegaConf.create({"lang_folder": lang_folder})
+        else:
+            cfg.datamodule.datasets.lang_dataset.lang_folder = lang_folder
+        if was_struct:
+            OmegaConf.set_struct(cfg.datamodule.datasets.lang_dataset, True)
     if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
         hydra.initialize("../../conf/datamodule/datasets")
     # we don't want to use shm dataset for evaluation
@@ -322,10 +372,7 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
     # datasets_cfg = hydra.initialize("datamodule/datasets/vision_lang.yaml")
     # since we don't use the trainer during inference, manually set up data_module
     # cfg.datamodule.datasets = datasets_cfg
-    if device_id != 'cpu':
-        device = torch.device(f"cuda:{device_id}")
-    else:
-        device = 'cpu'
+    device = get_device(device_id)
     cfg.datamodule.root_data_dir = dataset_path
     data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
     if prep_dm_and_deps:
@@ -401,10 +448,10 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
     patch_modeagent_embed_visual_obs_for_msillm(model)
 
     model.freeze()
-    model = model.cuda(device)
+    model = move_model_to_device(model, device)
     print("Successfully loaded model.")
 
-    return model, env, data_module, lang_embeddings
+    return model, env, data_module, lang_embeddings, cfg
 
 def load_mode_from_safetensor(
     filedir: Path,

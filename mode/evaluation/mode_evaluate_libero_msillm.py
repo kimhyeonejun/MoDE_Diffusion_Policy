@@ -5,77 +5,61 @@ import os
 from pathlib import Path
 import sys
 import time
+import gc
+from typing import Any, Dict, Tuple, Union
 
 import cv2
-from omegaconf import DictConfig, OmegaConf
-
-# This is for using the locally installed repo clone when using slurm
-sys.path.insert(0, Path(__file__).absolute().parents[2].as_posix())
 import hydra
 import numpy as np
+from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import seed_everything
-from tqdm.auto import tqdm
+from tqdm import tqdm
 import wandb
 import torch
-import torch.distributed as dist
 
-from mode.evaluation.utils import get_default_mode_and_env, get_msillm_mode_and_env
+# This is for using the locally installed repo clone when using slurm
+repo_root = Path(__file__).absolute().parents[2]
+sys.path.insert(0, repo_root.as_posix())
+
+# Add LIBERO submodule to path so 'libero' module can be imported
+libero_repo_dir = repo_root / "LIBERO"
+if libero_repo_dir.exists():
+    sys.path.insert(0, str(libero_repo_dir))
+    # Also set PYTHONPATH environment variable for subprocesses
+    current_pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
+
+from mode.evaluation.utils import get_msillm_mode_and_env
+from mode.evaluation.multistep_sequences import get_sequences
 from mode.rollout.rollout_video import RolloutVideo
 # Import LIBERO environment utilities
 from libero.libero import benchmark, get_libero_path
 from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv, DummyVectorEnv
-
-logger = logging.getLogger(__name__)
-
-
-from collections import Counter
-from itertools import chain
-import logging
-import multiprocessing
-import os
-from typing import Any
-import gc
-
-
-import hydra
-from tqdm import tqdm
-from omegaconf import DictConfig, OmegaConf
-import numpy as np
-from pytorch_lightning import Callback, LightningModule, Trainer
-from termcolor import colored
-import torch
-import torch.distributed as dist
-from libero.libero import benchmark, get_libero_path
-from libero.libero.benchmark import get_benchmark
-from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv, DummyVectorEnv
-from libero.lifelong.metric import raw_obs_to_tensor_obs, evaluate_multitask_training_success
 from libero.lifelong.utils import (get_task_embs, safe_device, create_experiment_dir)
-
-# import cv2
-# from pathlib import Path
-# import sys
-# sys.path.insert(0, Path(__file__).absolute().parents[2].as_posix())
-
-from mode.evaluation.multistep_sequences import get_sequences
-from mode.evaluation.utils import get_env_state_for_initial_condition, join_vis_lang, LangEmbeddings
-from mode.rollout.rollout_video import RolloutVideo
-from typing import Any, Dict, Tuple, Union
 
 
 log_print = logging.getLogger(__name__)
 
-def get_log_dir(log_dir):
-    if log_dir is not None:
-        log_dir = Path(log_dir)
+def get_log_dir(log_dir, checkpoint_name=None):
+    # Use checkpoint-based directory if checkpoint name is provided
+    if checkpoint_name:
+        checkpoint_stem = Path(checkpoint_name).stem  # Remove .ckpt extension
+        log_dir = Path("outputs") / checkpoint_stem
         os.makedirs(log_dir, exist_ok=True)
     else:
-        log_dir = Path(__file__).parents[3] / "evaluation"
-        if not log_dir.exists():
-            log_dir = Path("/tmp/evaluation")
-
-    log_dir = log_dir / "logs" / time.strftime("%Y-%m-%d_%H-%M-%S")
-    os.makedirs(log_dir, exist_ok=False)
+        # Fallback to Hydra's output directory or specified log_dir
+        hydra_output_dir = Path.cwd()
+        if (hydra_output_dir / ".hydra").exists():
+            # We're running under Hydra, use its output directory
+            log_dir = hydra_output_dir
+        elif log_dir is not None:
+            log_dir = Path(log_dir)
+            os.makedirs(log_dir, exist_ok=True)
+        else:
+            log_dir = Path(__file__).parents[3] / "outputs" / "libero_eval"
+            os.makedirs(log_dir, exist_ok=True)
+    
     print(f"logging to {log_dir}")
     return log_dir
 
@@ -169,6 +153,19 @@ class EvaluateLibero:
         for success, task_name in zip(successes, self.task_names):
             print(f"  {task_name}: {success:.4f} ({success*100:.2f}%)")
         print(f"{'='*60}\n")
+
+        # Save results to JSON file
+        results_dict = {
+            "average_success_rate": float(result_array),
+            "num_tasks": len(successes),
+            "per_task_success": {
+                task_name: float(success) for success, task_name in zip(successes, self.task_names)
+            }
+        }
+        results_file = self.log_dir / "results.json"
+        with open(results_file, 'w') as f:
+            json.dump(results_dict, f, indent=2)
+        print(f"Results saved to {results_file}")
 
         # Also log to logger
         log_print.info(f"eval_lh/avg_seq_len success rate {torch.tensor(result_array)}")
@@ -362,193 +359,83 @@ class EvaluateLibero:
 
         return return_obs, goal
 
-def main():
-    import argparse
-    from pathlib import Path
-    from omegaconf import OmegaConf
-    import hydra
-    from mode.evaluation.utils import load_msillm_from_torchhub
-
-    parser = argparse.ArgumentParser(
-        description='Evaluate MoDE model on LIBERO benchmark',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Use specific checkpoint
-  python mode/evaluation/mode_evaluate_libero_msillm.py --checkpoint msillm-NeuralCompression_main-msillm_quality_vlo1_epoch19.ckpt
-  
-  # Use latest checkpoint automatically
-  python mode/evaluation/mode_evaluate_libero_msillm.py --checkpoint latest
-  
-  # Use checkpoint by epoch number
-  python mode/evaluation/mode_evaluate_libero_msillm.py --checkpoint epoch=19
-  
-  # List available checkpoints
-  python mode/evaluation/mode_evaluate_libero_msillm.py --list_checkpoints
-        """
-    )
-    parser.add_argument('--train_folder', type=str, default='/home/hjkim/MoDE_Diffusion_Policy/saved_models',
-                        help='Folder containing checkpoints')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Checkpoint filename, "latest" for most recent, or "epoch=N" for specific epoch')
-    parser.add_argument('--list_checkpoints', action='store_true',
-                        help='List all available checkpoints and exit')
-    parser.add_argument('--log_dir', type=str, default='/home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval')
-    parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--log_wandb', action='store_true', default=False)
-    parser.add_argument('--num_videos', type=int, default=1)
-    parser.add_argument('--n_eval', type=int, default=2)
-    parser.add_argument('--benchmark_name', type=str, default='libero_10')
-    parser.add_argument('--max_steps', type=int, default=520)
-    parser.add_argument('--num_sequences', type=int, default=50)
-    parser.add_argument('--task_embedding_format', type=str, default='clip')
-
-    args = parser.parse_args()
-    
-    # Handle checkpoint selection
-    train_folder_path = Path(args.train_folder).expanduser()
-    
-    if args.list_checkpoints:
-        print("\nAvailable checkpoints:")
-        checkpoints = sorted(train_folder_path.glob("*.ckpt"), key=lambda x: x.stat().st_mtime, reverse=True)
-        for i, ckpt in enumerate(checkpoints, 1):
-            size_gb = ckpt.stat().st_size / (1024**3)
-            mtime = ckpt.stat().st_mtime
-            from datetime import datetime
-            mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-            print(f"  {i}. {ckpt.name} ({size_gb:.2f}GB, {mtime_str})")
-        print(f"\nTotal: {len(checkpoints)} checkpoints")
-        return
-    
-    if args.checkpoint is None:
-        # Try to find latest checkpoint
-        checkpoints = sorted(train_folder_path.glob("*.ckpt"), key=lambda x: x.stat().st_mtime, reverse=True)
-        if checkpoints:
-            args.checkpoint = checkpoints[0].name
-            print(f"No checkpoint specified, using latest: {args.checkpoint}")
-        else:
-            print("Error: No checkpoint specified and no checkpoints found!")
-            return
-    elif args.checkpoint == "latest":
-        # Find latest checkpoint
-        checkpoints = sorted(train_folder_path.glob("*.ckpt"), key=lambda x: x.stat().st_mtime, reverse=True)
-        if checkpoints:
-            args.checkpoint = checkpoints[0].name
-            print(f"Using latest checkpoint: {args.checkpoint}")
-        else:
-            print("Error: No checkpoints found!")
-            return
-    elif args.checkpoint.startswith("epoch="):
-        # Find checkpoint by epoch number
-        epoch_num = args.checkpoint.split("=")[1]
-        # Try different naming patterns
-        patterns = [
-            f"*epoch{epoch_num}.ckpt",
-            f"*epoch={epoch_num}.ckpt",
-            f"*epoch=epoch={epoch_num}.ckpt",
-        ]
-        found = False
-        for pattern in patterns:
-            matches = list(train_folder_path.glob(pattern))
-            if matches:
-                args.checkpoint = matches[0].name
-                print(f"Found checkpoint for epoch {epoch_num}: {args.checkpoint}")
-                found = True
-                break
-        if not found:
-            print(f"Error: No checkpoint found for epoch {epoch_num}")
-            print("Available checkpoints:")
-            for ckpt in sorted(train_folder_path.glob("*.ckpt")):
-                print(f"  - {ckpt.name}")
-            return
-
+@hydra.main(config_path="../../conf", config_name="mode_evaluate_libero_msillm")
+def main(cfg: DictConfig):
     seed_everything(0, workers=True)
-
-    # Load config and create model manually
-    with hydra.initialize(config_path='../../conf'):
-        cfg = hydra.compose(config_name='config_libero_msillm')
-
-    # Create model
-    model_cfg = cfg.model
-    model_cfg_dict = OmegaConf.to_container(model_cfg, resolve=True)
-    if "ckpt_path" in model_cfg_dict:
-        del model_cfg_dict["ckpt_path"]
-    model_cfg = OmegaConf.create(model_cfg_dict)
-
-    model = hydra.utils.instantiate(model_cfg)
-
-    # Setup MS-ILLM
-    msillm_model, _ = load_msillm_from_torchhub(cfg)
-    if msillm_model is not None:
-        setattr(model, "msillm_model", msillm_model)
-        print("Attached MS-ILLM model")
-
-    # Load weights
-    ckpt_path = train_folder_path / args.checkpoint
-    if not ckpt_path.exists():
-        print(f"Error: Checkpoint not found: {ckpt_path}")
-        print(f"Available checkpoints in {train_folder_path}:")
-        for ckpt in sorted(train_folder_path.glob("*.ckpt")):
-            print(f"  - {ckpt.name}")
-        return
     
-    print(f"Loading checkpoint: {ckpt_path}")
-    if ckpt_path.suffix == ".safetensors":
-        from safetensors.torch import load_file
-        state_dict = load_file(ckpt_path)
-        model.load_state_dict(state_dict, strict=False)
-    else:
-        sd = torch.load(ckpt_path, map_location='cpu')
-        if "state_dict" in sd:
-            sd = sd["state_dict"]
-        model.load_state_dict(sd, strict=False)
-
-    # Handle CUDA_VISIBLE_DEVICES safely: map requested device into visible set
+    # Hydra creates outputs/${hydra.job.name}/ directory
+    # We need to rename/move it to use checkpoint name without extension
+    # But Hydra already created the directory, so we'll work with what we have
+    # and ensure log_dir uses the checkpoint-based name
+    
+    # Handle CUDA_VISIBLE_DEVICES mapping
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda_visible:
         visible = [g.strip() for g in cuda_visible.split(",") if g.strip() != ""]
         mapped_max = len(visible) - 1
         if len(visible) == 0:
             raise RuntimeError("CUDA_VISIBLE_DEVICES is set but parsed to empty list.")
-        if args.device <= mapped_max:
-            device_id = args.device
+        if cfg.device <= mapped_max:
+            device_id = cfg.device
         else:
-            print(f"Requested device {args.device} but only {len(visible)} visible; falling back to 0")
+            print(f"Requested device {cfg.device} but only {len(visible)} visible; falling back to 0")
             device_id = 0
         physical = visible[device_id]
         print(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, using device {device_id} (maps to physical GPU {physical})")
     else:
-        device_id = args.device
+        device_id = cfg.device
         print(f"No CUDA_VISIBLE_DEVICES set, using device {device_id} (absolute index)")
+
+    # Load model using utility function (handles MS-ILLM automatically)
+    model, _, dm, _, loaded_cfg = get_msillm_mode_and_env(
+        cfg.train_folder,
+        cfg.dataset_path,
+        cfg.checkpoint,
+        env=None,
+        lang_embeddings=None,
+        eval_cfg_overwrite=cfg.eval_cfg_overwrite if hasattr(cfg, 'eval_cfg_overwrite') else {},
+        device_id=device_id,
+        prep_dm_and_deps=False
+    )
 
     model = model.to(f"cuda:{device_id}")
     model.eval()
 
-    log_dir = get_log_dir(args.log_dir)
-
-    # Create transforms directly from config (use validation transforms)
-    transforms_cfg = cfg.datamodule.transforms.val if "val" in cfg.datamodule.transforms else cfg.datamodule.transforms
-    transforms = hydra.utils.instantiate(transforms_cfg)
+    # Get log directory based on checkpoint name (without extension)
+    log_dir = get_log_dir(cfg.log_dir, checkpoint_name=cfg.checkpoint)
+    
+    # Get transforms from loaded config (use validation transforms if available)
+    try:
+        transforms_cfg = loaded_cfg.datamodule.transforms.val if "val" in loaded_cfg.datamodule.transforms else loaded_cfg.datamodule.transforms
+        transforms = hydra.utils.instantiate(transforms_cfg)
+    except (AttributeError, KeyError):
+        # Fallback: try from datamodule if available
+        if hasattr(dm, 'transforms') and dm.transforms is not None:
+            transforms = hydra.utils.instantiate(dm.transforms)
+        else:
+            # Final fallback: use main config
+            transforms_cfg = cfg.datamodule.transforms.val if "val" in cfg.datamodule.transforms else cfg.datamodule.transforms
+            transforms = hydra.utils.instantiate(transforms_cfg)
 
     eval_libero = EvaluateLibero(
         model=model,
         transforms=transforms,
         log_dir=log_dir,
-        benchmark_name=args.benchmark_name,
-        num_sequences=args.num_sequences,
-        num_videos=args.num_videos,
-        max_steps=args.max_steps,
-        n_eval=args.n_eval,
-        task_embedding_format=args.task_embedding_format,
-        device=device_id,  # Use the mapped device ID
+        benchmark_name=cfg.benchmark_name,
+        num_sequences=cfg.num_sequences,
+        num_videos=cfg.num_videos,
+        max_steps=cfg.max_steps,
+        n_eval=cfg.n_eval,
+        task_embedding_format=cfg.task_embedding_format,
+        device=device_id,
     )
 
-    if args.log_wandb:
+    if cfg.log_wandb:
         os.makedirs(log_dir / "wandb", exist_ok=False)
         run = wandb.init(
             project='mode_libero_eval',
-            entity='your_entity',  # replace with your wandb entity
-            config=vars(args),
+            entity=cfg.wandb_entity,
+            config=OmegaConf.to_container(cfg, resolve=True),
         )
 
     # Actually run the evaluation!
@@ -558,7 +445,7 @@ Examples:
     eval_libero.setup()
     eval_libero.start()
 
-    if args.log_wandb:
+    if cfg.log_wandb:
         run.finish()
     
     print("\n" + "="*50)
@@ -567,8 +454,4 @@ Examples:
 
 
 if __name__ == "__main__":
-    import sys
-
-    # If the user set CUDA_VISIBLE_DEVICES, just respect it and do nothing here.
-    # Otherwise, do not override device; use args.device default (4) as absolute index.
     main()
