@@ -627,7 +627,36 @@ def train(cfg: DictConfig) -> None:
         # Check if we're resuming from checkpoint
         # Note: We load model weights manually here to handle MS-ILLM submodule,
         # but also pass ckpt_path to Trainer.fit() to restore optimizer/scheduler state
-        last_checkpoint = get_last_checkpoint(Path.cwd())
+        last_checkpoint = None
+
+        # Check for explicit resume checkpoint first (config or env var)
+        resume_checkpoint_path = None
+
+        # Check environment variable first (highest priority)
+        env_checkpoint = os.environ.get('RESUME_CHECKPOINT')
+        if env_checkpoint:
+            resume_checkpoint_path = Path(env_checkpoint)
+            log_rank_0(f"Using checkpoint from environment variable: {resume_checkpoint_path}")
+
+        # Then check config file
+        elif "resume_from_checkpoint" in cfg and cfg.resume_from_checkpoint is not None:
+            resume_checkpoint_path = Path(cfg.resume_from_checkpoint)
+            log_rank_0(f"Using checkpoint from config: {resume_checkpoint_path}")
+
+        if resume_checkpoint_path:
+            if resume_checkpoint_path.exists():
+                last_checkpoint = resume_checkpoint_path
+                log_rank_0(f"Resuming from specified checkpoint: {last_checkpoint}")
+            else:
+                log_rank_0(f"Specified checkpoint not found: {resume_checkpoint_path}, falling back to auto-detection")
+                last_checkpoint = None
+
+        # Auto-detect latest checkpoint if none specified
+        if last_checkpoint is None:
+            last_checkpoint = get_last_checkpoint(Path.cwd())
+            if last_checkpoint is not None:
+                log_rank_0(f"Auto-detected latest checkpoint: {last_checkpoint}")
+
         if last_checkpoint is None:
             model = hydra.utils.instantiate(cfg.model)
             # Load MS-ILLM (pretrained) if configured and attach as a submodule so Lightning moves it with the model.

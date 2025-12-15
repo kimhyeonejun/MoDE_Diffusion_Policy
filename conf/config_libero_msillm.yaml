@@ -22,6 +22,8 @@ log_dir: ./logs
 slurm: false
 future_range: 29
 seed: 42
+# Resume from specific checkpoint (optional)
+resume_from_checkpoint: null  # Set to path like: saved_models/msillm-xxx_epoch=epoch=19.ckpt
 device: 'cuda'
 batch_size: 128 # 38 # 128
 # Number of GPU devices to use (passed through to `trainer.devices` below).
@@ -59,6 +61,9 @@ callbacks:
     mode: min  # Changed from max since we want to minimize loss
     dirpath: ${hydra:runtime.cwd}/saved_models  # Use absolute path for clarity
     filename: 'epoch={epoch:02d}'  # Simplified filename - PyTorch Lightning creates directories when metric name contains '/'
+  #ema:
+  #  save_ema_weights_in_callback_state: False  # Don't save EMA weights in checkpoint to reduce size (~3.77GB savings)
+    # EMA weights are only needed for inference, not for resuming training
 
 # Pretrained MoDE weights from Hugging Face
 # Set to Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10") or local file path
