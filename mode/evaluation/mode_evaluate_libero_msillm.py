@@ -363,6 +363,30 @@ class EvaluateLibero:
 def main(cfg: DictConfig):
     seed_everything(0, workers=True)
     
+    # Handle checkpoint path from environment variable if provided (useful when filename contains '=' which breaks Hydra parsing)
+    checkpoint_env = os.environ.get("CHECKPOINT_PATH")
+    if checkpoint_env:
+        print(f"Using checkpoint from environment variable: {checkpoint_env}")
+        cfg.checkpoint = checkpoint_env
+    
+    # Sanitize checkpoint filename: replace '=' with '-' to avoid Hydra parsing issues
+    if "=" in cfg.checkpoint and not Path(cfg.checkpoint).is_absolute():
+        # Only sanitize if it's a relative path (filename only)
+        sanitized_checkpoint = cfg.checkpoint.replace("=", "-")
+        checkpoint_path = Path(cfg.train_folder) / cfg.checkpoint
+        sanitized_path = Path(cfg.train_folder) / sanitized_checkpoint
+        
+        # If sanitized file exists, use it; otherwise try original
+        if sanitized_path.exists():
+            print(f"Using sanitized checkpoint path: {sanitized_checkpoint}")
+            cfg.checkpoint = sanitized_checkpoint
+        elif checkpoint_path.exists():
+            print(f"Warning: Checkpoint filename contains '=' which may cause Hydra parsing issues.")
+            print(f"Consider renaming: {checkpoint_path} -> {sanitized_path}")
+            print(f"Using original checkpoint path: {cfg.checkpoint}")
+        else:
+            print(f"Warning: Checkpoint not found: {checkpoint_path}")
+    
     # Hydra creates outputs/${hydra.job.name}/ directory
     # We need to rename/move it to use checkpoint name without extension
     # But Hydra already created the directory, so we'll work with what we have
