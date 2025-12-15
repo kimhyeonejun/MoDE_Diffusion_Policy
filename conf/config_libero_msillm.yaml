@@ -66,7 +66,7 @@ callbacks:
     monitor: val_act/lang_act_loss_pp  # Changed from eval_lh/avg_seq_len since rollout_lh callback is disabled
     mode: min  # Changed from max since we want to minimize loss
     dirpath: ${hydra:runtime.cwd}/saved_models  # Use absolute path for clarity
-    filename: 'epoch={epoch:02d}'  # Simplified filename - PyTorch Lightning creates directories when metric name contains '/'
+    filename: 'epoch-{epoch:02d}'  # Simplified filename - Using '-' instead of '=' to avoid Hydra parsing issues
   #ema:
   #  save_ema_weights_in_callback_state: False  # Don't save EMA weights in checkpoint to reduce size (~3.77GB savings)
     # EMA weights are only needed for inference, not for resuming training

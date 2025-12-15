@@ -283,7 +283,9 @@ def setup_callbacks(callbacks_cfg: DictConfig, msillm_info: str = "") -> list[Ca
         else:
             # Update checkpoint filename in config before instantiation if MS-ILLM info is available
             if cb_name == "checkpoint" and msillm_info and "filename" in cb_cfg:
-                original_filename = cb_cfg.get("filename", "epoch={epoch:02d}")
+                original_filename = cb_cfg.get("filename", "epoch-{epoch:02d}")
+                # Replace '=' with '-' in filename to avoid Hydra parsing issues
+                original_filename = original_filename.replace("=", "-")
                 # Prepend MS-ILLM info to filename
                 cb_cfg["filename"] = f"{msillm_info}_{original_filename}"
             
