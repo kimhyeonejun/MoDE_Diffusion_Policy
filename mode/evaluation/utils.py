@@ -14,6 +14,7 @@ import types
 from omegaconf import DictConfig
 from safetensors.torch import load_file
 from hydra.core.global_hydra import GlobalHydra
+from huggingface_hub import hf_hub_download
 
 from mode.utils.utils import add_text, format_sftp_path
 
@@ -195,50 +196,164 @@ def get_default_model_and_env(train_folder, dataset_path, checkpoint, env=None, 
 
 
 def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
-    train_cfg_path = Path(train_folder) / checkpoint / ".hydra/config.yaml"
-    train_cfg_path = format_sftp_path(train_cfg_path)
-    def_cfg = OmegaConf.load(train_cfg_path)
-    eval_override_cfg = OmegaConf.create(eval_cfg_overwrite)
-    cfg = OmegaConf.merge(def_cfg, eval_override_cfg)
-    lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
-    if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
-        hydra.initialize("../../conf/datamodule/datasets")
-    # we don't want to use shm dataset for evaluation
-    # GlobalHydra.instance().clear()
-    # datasets_cfg = hydra.initialize("datamodule/datasets/vision_lang.yaml")
-    # since we don't use the trainer during inference, manually set up data_module
-    # cfg.datamodule.datasets = datasets_cfg
-    device = get_device(device_id)
-    cfg.datamodule.root_data_dir = dataset_path
-    data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
-    if prep_dm_and_deps:
-        data_module.prepare_data()
-        data_module.setup()
-        dataloader = data_module.val_dataloader()
-        dataset = dataloader["lang"].dataset
+    # Check if checkpoint is a Hugging Face repo ID (contains "/" and doesn't look like a file path)
+    is_hf_repo = "/" in str(checkpoint) and not Path(checkpoint).exists() and not Path(checkpoint).is_absolute()
+    
+    if is_hf_repo:
+        # Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10")
+        repo_id = str(checkpoint)
+        filename = "model_cleaned.safetensors"  # Default filename for Hugging Face checkpoints
+        
+        # Use default config instead of trying to load from Hugging Face
+        if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+            hydra.initialize("../../conf")
+        
+        try:
+            def_cfg = hydra.compose(config_name="config_libero")
+        except:
+            # Fallback: try to load from train_folder if it exists
+            train_cfg_path = Path(train_folder) / ".hydra/config.yaml"
+            if train_cfg_path.exists():
+                def_cfg = OmegaConf.load(train_cfg_path)
+            else:
+                raise FileNotFoundError(f"Could not find config. Tried config_libero.yaml and {train_cfg_path}")
+        
+        # Temporarily disable struct mode for lang_dataset if needed before merge
+        if hasattr(def_cfg.datamodule.datasets, 'lang_dataset') and OmegaConf.is_struct(def_cfg.datamodule.datasets.lang_dataset):
+            OmegaConf.set_struct(def_cfg.datamodule.datasets.lang_dataset, False)
+            struct_was_enabled = True
+        else:
+            struct_was_enabled = False
+        
+        eval_override_cfg = OmegaConf.create(eval_cfg_overwrite)
+        cfg = OmegaConf.merge(def_cfg, eval_override_cfg)
+        
+        # Re-enable struct mode if it was enabled
+        if struct_was_enabled and hasattr(cfg.datamodule.datasets, 'lang_dataset'):
+            try:
+                OmegaConf.set_struct(cfg.datamodule.datasets.lang_dataset, True)
+            except:
+                pass  # Don't fail if we can't re-enable struct mode
+        
+        if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+            hydra.initialize("../../conf/datamodule/datasets")
+        
+        device = get_device(device_id)
+        cfg.datamodule.root_data_dir = dataset_path
+        data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
+        
+        if prep_dm_and_deps:
+            data_module.prepare_data()
+            data_module.setup()
+            dataloader = data_module.val_dataloader()
+            dataset = dataloader["lang"].dataset
 
-        if lang_embeddings is None:
-            lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
+            if lang_embeddings is None:
+                # Get lang_folder only when needed, with fallback
+                lang_folder = "lang_annotations"  # Default fallback
+                try:
+                    # Try to get from eval_cfg_overwrite first
+                    if "datamodule" in eval_cfg_overwrite and "datasets" in eval_cfg_overwrite["datamodule"]:
+                        if "lang_dataset" in eval_cfg_overwrite["datamodule"]["datasets"]:
+                            if "lang_folder" in eval_cfg_overwrite["datamodule"]["datasets"]["lang_dataset"]:
+                                lang_folder = eval_cfg_overwrite["datamodule"]["datasets"]["lang_dataset"]["lang_folder"]
+                    # Otherwise try from config (but don't fail if struct mode blocks it)
+                    elif hasattr(cfg.datamodule.datasets, 'lang_dataset'):
+                        try:
+                            lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
+                        except (AttributeError, KeyError):
+                            pass  # Use default
+                except:
+                    pass  # Use default
+                
+                lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
 
-        if env is None:
-            rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
-            env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
+            if env is None:
+                rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
+                env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
+
+        # Instantiate model
+        model_cfg = cfg.model
+        model_cfg_dict = OmegaConf.to_container(model_cfg, resolve=True)
+        if "ckpt_path" in model_cfg_dict:
+            del model_cfg_dict["ckpt_path"]
+        model_cfg = OmegaConf.create(model_cfg_dict)
+        model = hydra.utils.instantiate(model_cfg)
+        
+        # Load weights from Hugging Face
+        print(f"Loading model weights from Hugging Face: {repo_id}/{filename}")
+        ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
+        state_dict = load_file(ckpt_path)
+        
+        # Handle potential key prefixes
+        fixed_state_dict = {}
+        for k, v in state_dict.items():
+            k2 = k
+            if k2.startswith("state_dict."):
+                k2 = k2[len("state_dict."):]
+            if k2.startswith("model."):
+                k2 = k2[len("model."):]
+            fixed_state_dict[k2] = v
+        
+        missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
+        print(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
+        if missing:
+            print(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
+        if unexpected:
+            print(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+        
+        model.freeze()
+        model = move_model_to_device(model, device)
+        print("Successfully loaded model from Hugging Face.")
+        
+        return model, env, data_module, lang_embeddings
+    
+    else:
+        # Local checkpoint path
+        train_cfg_path = Path(train_folder) / checkpoint / ".hydra/config.yaml"
+        train_cfg_path = format_sftp_path(train_cfg_path)
+        def_cfg = OmegaConf.load(train_cfg_path)
+        eval_override_cfg = OmegaConf.create(eval_cfg_overwrite)
+        cfg = OmegaConf.merge(def_cfg, eval_override_cfg)
+        lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
+        if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+            hydra.initialize("../../conf/datamodule/datasets")
+        # we don't want to use shm dataset for evaluation
+        # GlobalHydra.instance().clear()
+        # datasets_cfg = hydra.initialize("datamodule/datasets/vision_lang.yaml")
+        # since we don't use the trainer during inference, manually set up data_module
+        # cfg.datamodule.datasets = datasets_cfg
+        device = get_device(device_id)
+        cfg.datamodule.root_data_dir = dataset_path
+        data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
+        if prep_dm_and_deps:
+            data_module.prepare_data()
+            data_module.setup()
+            dataloader = data_module.val_dataloader()
+            dataset = dataloader["lang"].dataset
+
+            if lang_embeddings is None:
+                lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
+
+            if env is None:
+                rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
+                env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
 
 
-    # new stuff
-    # overwrite_cfg = cfg.overwrite_module_cfg if "overwrite_module_cfg" in cfg else {}
-    module_path = (Path(train_folder).expanduser())
+        # new stuff
+        # overwrite_cfg = cfg.overwrite_module_cfg if "overwrite_module_cfg" in cfg else {}
+        module_path = (Path(train_folder).expanduser())
 
-    print(f"Loading model from {module_path / checkpoint}")
-    model = load_mode_from_safetensor(
-        module_path / checkpoint,
-        overwrite_cfg=eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {},
-    )
-    model.freeze()
-    model = move_model_to_device(model, device)
-    print("Successfully loaded model.")
+        print(f"Loading model from {module_path / checkpoint}")
+        model = load_mode_from_safetensor(
+            module_path / checkpoint,
+            overwrite_cfg=eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {},
+        )
+        model.freeze()
+        model = move_model_to_device(model, device)
+        print("Successfully loaded model.")
 
-    return model, env, data_module, lang_embeddings
+        return model, env, data_module, lang_embeddings
 
 # Helper functions for MS-ILLM
 def extract_compression_modules(compression_model: torch.nn.Module):
@@ -404,14 +519,7 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
         
     model = hydra.utils.instantiate(model_cfg)
 
-    # 2. Setup MS-ILLM
-    msillm_model, _ = load_msillm_from_torchhub(cfg)
-    if msillm_model is not None:
-        setattr(model, "msillm_model", msillm_model)
-        print("Attached MS-ILLM model")
-
-    # 3. Load Weights
-    # Determine the weight file
+    # 2. Determine the weight file first (to check if MS-ILLM weights are in checkpoint)
     weight_file = None
     if ckpt_path.is_file():
         weight_file = ckpt_path
@@ -434,15 +542,78 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
         # But we are loading.
         raise FileNotFoundError(f"Could not find model weights in {ckpt_path}")
     
+    # Check if checkpoint contains MS-ILLM weights
+    checkpoint_has_msillm = False
+    if weight_file.suffix == ".safetensors":
+        try:
+            state_dict = load_file(weight_file)
+            msillm_keys = [k for k in state_dict.keys() if k.startswith("msillm_model")]
+            checkpoint_has_msillm = len(msillm_keys) > 0
+            if checkpoint_has_msillm:
+                print(f"Found {len(msillm_keys)} MS-ILLM weights in checkpoint")
+        except:
+            pass
+    else:
+        try:
+            sd = torch.load(weight_file, map_location='cpu')
+            state_dict_to_check = sd.get("state_dict", sd)
+            msillm_keys = [k for k in state_dict_to_check.keys() if k.startswith("msillm_model")]
+            checkpoint_has_msillm = len(msillm_keys) > 0
+            if checkpoint_has_msillm:
+                print(f"Found {len(msillm_keys)} MS-ILLM weights in checkpoint")
+        except:
+            pass
+    
+    # 3. Setup MS-ILLM (only if checkpoint doesn't have MS-ILLM weights)
+    if not checkpoint_has_msillm:
+        msillm_model, _ = load_msillm_from_torchhub(cfg)
+        if msillm_model is not None:
+            setattr(model, "msillm_model", msillm_model)
+            print("Attached MS-ILLM model from torch hub (pretrained weights)")
+    else:
+        print("MS-ILLM weights will be loaded from checkpoint")
+
+    # 4. Load Weights
     print(f"Loading weights from {weight_file}")
     if weight_file.suffix == ".safetensors":
         state_dict = load_file(weight_file)
         model.load_state_dict(state_dict, strict=False)
     else:
         sd = torch.load(weight_file, map_location='cpu')
-        if "state_dict" in sd:
-            sd = sd["state_dict"]
-        model.load_state_dict(sd, strict=False)
+        
+        # Try to load EMA weights if available (preferred for evaluation)
+        ema_loaded = False
+        if "callbacks" in sd and "EMA" in sd["callbacks"]:
+            ema_callback_state = sd["callbacks"]["EMA"]
+            if "ema_weights" in ema_callback_state:
+                ema_weights_list = ema_callback_state["ema_weights"]
+                # Convert list of tensors to state_dict format
+                model_state_dict = model.state_dict()
+                ema_weights_dict = {}
+                param_idx = 0
+                for name, _ in model_state_dict.items():
+                    if param_idx < len(ema_weights_list):
+                        ema_weights_dict[name] = ema_weights_list[param_idx]
+                        param_idx += 1
+                    else:
+                        break
+                
+                if len(ema_weights_dict) > 0:
+                    model.load_state_dict(ema_weights_dict, strict=False)
+                    ema_loaded = True
+                    print("Successfully loaded EMA weights from checkpoint!")
+        
+        # Fallback to regular state_dict if EMA weights not available
+        if not ema_loaded:
+            if "state_dict" in sd:
+                sd = sd["state_dict"]
+            model.load_state_dict(sd, strict=False)
+            print("Loaded regular weights (EMA weights not found or failed to load)")
+    
+    # Verify MS-ILLM weights were loaded
+    if hasattr(model, "msillm_model") and model.msillm_model is not None:
+        msillm_state = model.msillm_model.state_dict()
+        print(f"MS-ILLM model has {len(msillm_state)} parameters")
 
     # 4. Patch MS-ILLM forward
     patch_modeagent_embed_visual_obs_for_msillm(model)

@@ -10,7 +10,17 @@ import cv2
 from omegaconf import DictConfig, OmegaConf
 
 # This is for using the locally installed repo clone when using slurm
-sys.path.insert(0, Path(__file__).absolute().parents[2].as_posix())
+repo_root = Path(__file__).absolute().parents[2]
+sys.path.insert(0, repo_root.as_posix())
+
+# Add LIBERO submodule to path so 'libero' module can be imported
+libero_repo_dir = repo_root / "LIBERO"
+if libero_repo_dir.exists():
+    sys.path.insert(0, str(libero_repo_dir))
+    # Also set PYTHONPATH environment variable for subprocesses
+    current_pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
+
 import hydra
 import numpy as np
 from pytorch_lightning import seed_everything
@@ -123,15 +133,21 @@ class EvaluateLibero:
         self.init_states_paths = []
         self.cfg = {}
         self.descriptions = []
-        self.create_cfg_for_libero(self.task_embedding_format)
+        # First, collect all descriptions
         for i in range(self.num_tasks):
-
             task_i = self.benchmark_instance.get_task(0)
-
             self.init_states_paths.append(
                 os.path.join(self.init_states_folder, self.task_names[i], task_i.init_states_file)
             )
             self.descriptions.append(self.benchmark_instance.get_task(i).language)
+
+        # Now create cfg and task embeddings with descriptions available
+        self.create_cfg_for_libero(self.task_embedding_format)
+        
+        # Use task embeddings created in create_cfg_for_libero
+        if hasattr(self, 'task_embs'):
+            self.benchmark_instance.set_task_embs(self.task_embs)
+        else:
             task_embs = get_task_embs(self.cfg, self.descriptions)
             self.benchmark_instance.set_task_embs(task_embs)
 
@@ -257,12 +273,37 @@ class EvaluateLibero:
         return success_rate
 
     def create_cfg_for_libero(self, task_embedding_format):
-        self.cfg = DictConfig({'task_embedding_format': task_embedding_format,
-                               'data': {'max_word_len': 25}})
+        self.cfg = DictConfig({
+            'task_embedding_format': task_embedding_format,
+            'data': {'max_word_len': 25},
+            'task_embedding_one_hot_offset': 1
+        })
 
         self.cfg.policy = OmegaConf.create()
         self.cfg.policy.language_encoder = OmegaConf.create()
         self.cfg.policy.language_encoder.network_kwargs = OmegaConf.create()
+
+        # Create task embeddings - same as training: use get_task_embs
+        # If that fails, fall back to 2-dim random embeddings
+        import torch
+        num_tasks = len(self.descriptions)
+        
+        try:
+            # Use get_task_embs same as training (libero_dataset.py line 147)
+            task_embs = get_task_embs(self.cfg, self.descriptions)
+            self.task_embs = task_embs
+            print(f"Created {num_tasks} {task_embedding_format} task embeddings using get_task_embs (dim={task_embs[0].shape[0]})")
+            return
+        except Exception as e:
+            print(f"Warning: Failed to load task embeddings using get_task_embs: {e}")
+            print("Falling back to 2-dim random embeddings")
+            task_embs = []
+            for i in range(num_tasks):
+                emb = torch.randn(2, device=self.device if self.device else torch.device("cpu"))
+                task_embs.append(emb)
+            self.task_embs = task_embs
+            print(f"Created {num_tasks} random task embeddings (dim=2)")
+            return
 
 
     def translate_obs_space(self, obs_space):

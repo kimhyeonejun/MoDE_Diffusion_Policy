@@ -131,6 +131,16 @@ class RolloutVideo:
         if isinstance(self.logger, WandbLogger) and not self.log_to_file:
             for video, tag in zip(self.videos, self.tags):
                 video = np.clip(video.numpy() * 255, 0, 255).astype(np.uint8)
+                # Fix: Rotate 180 degrees and convert BGR to RGB
+                # video shape: (1, t, c, h, w)
+                if len(video.shape) == 5:
+                    video = video[0]  # Remove batch dimension: (t, c, h, w)
+                # Rotate 180 degrees on height and width axes
+                video = np.rot90(video, k=2, axes=(2, 3))  # Rotate on h, w axes
+                # Convert BGR to RGB by reversing the channel dimension
+                video = np.flip(video, axis=1)  # Reverse channels: BGR -> RGB
+                # Reshape back to (1, t, c, h, w) for wandb
+                video = video[np.newaxis, ...]
                 wandb_vid = wandb.Video(video, fps=10, format="gif")
                 self.video_paths[tag] = wandb_vid._path
             self.videos = []
@@ -191,7 +201,14 @@ class RolloutVideo:
                 self._plot_video_tb(video, tag, global_step)
 
     def _plot_video_tb(self, video, tag, global_step):
-        video = video.unsqueeze(0)
+        # video shape: (t, c, h, w) or (1, t, c, h, w)
+        if video.dim() == 4:
+            video = video.unsqueeze(0)  # Add batch dimension: (1, t, c, h, w)
+        # Fix: Rotate 180 degrees and convert BGR to RGB
+        # Rotate 180 degrees on height and width axes (dims 3 and 4)
+        video = torch.rot90(video, k=2, dims=(3, 4))
+        # Convert BGR to RGB by reversing the channel dimension (dim 2)
+        video = video.flip(dims=(2,))  # Reverse channels: BGR -> RGB
         self.logger.experiment.add_video(f"video{tag}", video, global_step=global_step, fps=10)
 
     def _log_videos_to_wandb(self):
@@ -241,6 +258,13 @@ class RolloutVideo:
                 required='wandb.Video requires moviepy and imageio when passing raw data.  Install with "pip install moviepy imageio"',
             )
             tensor = self._prepare_video(video)
+            # Fix: Rotate 180 degrees and convert BGR to RGB
+            # tensor shape: (t, h, w, c)
+            # Rotate each frame 180 degrees
+            tensor = np.rot90(tensor, k=2, axes=(1, 2))  # Rotate 180 degrees on height and width axes
+            # Convert BGR to RGB by reversing the channel dimension
+            tensor = tensor[..., ::-1]  # Reverse channels: BGR -> RGB
+            
             # Resize tensor if resolution scale is not 1.0
             if self.resolution_scale != 1.0:
                 tensor = self._resize_video(tensor)
@@ -283,6 +307,9 @@ class RolloutVideo:
             # Iterate through the video tensor and save every nth frame to the subfolder
             for frame_index in range(0, total_frames, n):
                 frame = video_tensor[0, frame_index].permute(1, 2, 0).cpu().numpy()
+                # Fix: Rotate 180 degrees and convert BGR to RGB
+                frame = np.rot90(frame, k=2)  # Rotate 180 degrees
+                frame = frame[..., ::-1]  # Convert BGR to RGB
                 if channels == 1:  # If grayscale, remove the color dimension
                     frame = frame.squeeze(-1)
                 frame_image = Image.fromarray((frame * 255).astype('uint8'))  # Assuming frame values are normalized

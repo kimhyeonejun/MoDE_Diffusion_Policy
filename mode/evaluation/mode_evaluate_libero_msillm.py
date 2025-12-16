@@ -32,6 +32,11 @@ if libero_repo_dir.exists():
 from mode.evaluation.utils import get_msillm_mode_and_env
 from mode.evaluation.multistep_sequences import get_sequences
 from mode.rollout.rollout_video import RolloutVideo
+from mode.utils.bpp_utils import (
+    calculate_bpp_from_encoder_output,
+    accumulate_bpp_stats,
+    compute_average_bpp,
+)
 # Import LIBERO environment utilities
 from libero.libero import benchmark, get_libero_path
 from libero.libero.benchmark import get_benchmark
@@ -110,6 +115,9 @@ class EvaluateLibero:
         self.cfg = {}
         self.descriptions = []
         
+        # BPP statistics tracking
+        self.bpp_stats = {}
+        
         # First, collect all descriptions
         for i in range(self.num_tasks):
             task_i = self.benchmark_instance.get_task(0)
@@ -174,6 +182,24 @@ class EvaluateLibero:
             log_print.info(f"eval_lh/sr_{task_name} with success {success}")
             if wandb.run is not None:
                 wandb.log({f"eval_lh/sr_{task_name}": success})
+        
+        # Log BPP statistics if available
+        if self.bpp_stats:
+            avg_bpp = compute_average_bpp(self.bpp_stats)
+            print(f"\n{'='*60}")
+            print(f"BPP Statistics:")
+            print(f"{'='*60}")
+            for key, bpp_value in avg_bpp.items():
+                print(f"  {key}: {bpp_value:.4f} bpp")
+                log_print.info(f"bpp/{key}: {bpp_value:.4f}")
+                if wandb.run is not None:
+                    wandb.log({f"bpp/{key}": bpp_value})
+            print(f"{'='*60}\n")
+            
+            # Add to results dict
+            results_dict["bpp"] = {k: float(v) for k, v in avg_bpp.items()}
+            with open(results_file, 'w') as f:
+                json.dump(results_dict, f, indent=2)
 
     def evaluate_policy(self, model, store_video=False):
         successes = []
@@ -191,6 +217,32 @@ class EvaluateLibero:
         return successes
 
     def evaluate_task(self, model, task_i, task_emb, task_str, idx, sim_states=None, store_video=0):
+        # Setup BPP measurement by wrapping encoder to capture latents
+        msillm_model = getattr(model, "msillm_model", None)
+        encoder = None
+        original_encoder_forward = None
+        
+        if msillm_model is not None:
+            encoder = getattr(msillm_model, "encoder", None)
+            if encoder is not None:
+                # Store original forward method
+                original_encoder_forward = encoder.forward
+                
+                # Wrap encoder to capture latents when called
+                def _capture_encoder_forward(*args, **kwargs):
+                    latent = original_encoder_forward(*args, **kwargs)
+                    # Store latent for BPP calculation
+                    # We'll identify which image it is by checking the input shape or using a counter
+                    if not hasattr(_capture_encoder_forward, 'call_count'):
+                        _capture_encoder_forward.call_count = 0
+                        _capture_encoder_forward.latents = []
+                    
+                    _capture_encoder_forward.call_count += 1
+                    _capture_encoder_forward.latents.append(latent)
+                    return latent
+                
+                encoder.forward = _capture_encoder_forward
+        
         env_args = {
             "bddl_file_name": os.path.join(
                 self.bddl_folder, task_i.problem_folder, task_i.bddl_file
@@ -222,67 +274,128 @@ class EvaluateLibero:
         # Inference-only evaluation
         with torch.inference_mode():
             for i in tqdm(range(self.n_eval), desc="Evaluating"):
-                store_video_this_rollout = i < store_video
-                if store_video_this_rollout:
-                    video_frames = []
-                    video_filename = f"rollout_{task_str}_nmp_{i}.mp4"
-                    video_path = os.path.join(self.log_dir, video_filename)
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
-                    video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
-
-                env.reset()
-
-                done = False
-                steps = 0
-                model.reset()
-
-                # Use per-rollout init state if a list is provided
-                state = init_states
-                if isinstance(init_states, (list, tuple)):
-                    state = init_states[i % len(init_states)]
-
-                # Some saved init states are numpy arrays that do not match MuJoCo's expected (MjData, float) signature.
-                # To avoid type errors during evaluation, always fall back to a clean reset.
                 try:
-                    obs = env.reset()
-                except Exception as e:
-                    log_print.warning(f"env.reset() failed on rollout {i}: {e}; retrying after short sleep")
-                    time.sleep(1)
-                    obs = env.reset()
+                    store_video_this_rollout = i < store_video
+                    if store_video_this_rollout:
+                        video_frames = []
+                        video_filename = f"rollout_{task_str}_nmp_{i}.mp4"
+                        video_path = os.path.join(self.log_dir, video_filename)
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
+                        video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
 
-                # dummy actions [env_num, 7] all zeros for initial physics simulation
-                dummy = np.zeros(7)
-                for _ in range(5):
-                    obs, _, _, _ = env.step(dummy)
+                    env.reset()
 
-                if task_str != "":
-                    sim_state = env.get_sim_state()
-                    if sim_states is not None:
-                        sim_states[i].append(sim_state)
+                    done = False
+                    steps = 0
+                    model.reset()
 
-                while steps < self.max_steps:
-                    steps += 1
+                    # Use per-rollout init state if a list is provided
+                    state = init_states
+                    if isinstance(init_states, (list, tuple)):
+                        state = init_states[i % len(init_states)]
 
-                    data, goal = self.process_env_obs(obs, task_emb, task_i.language)
-                    actions = model.step(data, goal)
-                    actions = actions.cpu().numpy()
-                    obs, reward, done, info = env.step(actions)
+                    # Some saved init states are numpy arrays that do not match MuJoCo's expected (MjData, float) signature.
+                    # To avoid type errors during evaluation, always fall back to a clean reset.
+                    try:
+                        obs = env.reset()
+                    except Exception as e:
+                        log_print.warning(f"env.reset() failed on rollout {i}: {e}; retrying after short sleep")
+                        time.sleep(1)
+                        obs = env.reset()
+
+                    # dummy actions [env_num, 7] all zeros for initial physics simulation
+                    dummy = np.zeros(7)
+                    for _ in range(5):
+                        obs, _, _, _ = env.step(dummy)
+
+                    if task_str != "":
+                        sim_state = env.get_sim_state()
+                        if sim_states is not None:
+                            sim_states[i].append(sim_state)
+
+                    while steps < self.max_steps:
+                        steps += 1
+
+                        data, goal = self.process_env_obs(obs, task_emb, task_i.language)
+                        
+                        # Clear captured latents for this step
+                        if encoder is not None and hasattr(encoder.forward, 'latents'):
+                            encoder.forward.latents = []
+                            encoder.forward.call_count = 0
+                        
+                        actions = model.step(data, goal)
+                        
+                        # Calculate BPP from captured latents (compression happened in model.step)
+                        if encoder is not None and hasattr(encoder.forward, 'latents') and len(encoder.forward.latents) > 0:
+                            bpp_dict = {}
+                            # encoder.forward.latents contains latents in order: [rgb_static_latent, rgb_gripper_latent]
+                            # Each latent corresponds to one image after reshape to (b*t, c, h, w)
+                            keys = ['rgb_static', 'rgb_gripper']
+                            for idx_latent, key in enumerate(keys):
+                                if idx_latent < len(encoder.forward.latents):
+                                    latent = encoder.forward.latents[idx_latent]
+                                    # Get original image shape from data
+                                    if key in data.get('rgb_obs', {}):
+                                        img = data['rgb_obs'][key]  # (1, C, H, W)
+                                        # Remove batch dim for BPP calculation
+                                        img_for_bpp = img.squeeze(0)  # (C, H, W)
+                                        
+                                        # Calculate BPP
+                                        bpp = calculate_bpp_from_encoder_output(
+                                            latent,
+                                            img_for_bpp,
+                                            bits_per_element=8,  # Assuming 8-bit quantization
+                                        )
+                                        bpp_dict[key] = bpp
+                            
+                            # Accumulate BPP statistics
+                            if bpp_dict:
+                                self.bpp_stats = accumulate_bpp_stats(bpp_dict, self.bpp_stats)
+                        
+                        actions = actions.cpu().numpy()
+                        obs, reward, done, info = env.step(actions)
+
+                        if store_video_this_rollout:
+                            frame = obs['agentview_image']
+                            # Fix: Rotate 180 degrees and convert BGR to RGB
+                            # Rotate 180 degrees on height and width axes
+                            frame = np.rot90(frame, k=2, axes=(0, 1))  # Rotate on h, w axes
+                            # Convert BGR to RGB by reversing the channel dimension
+                            frame = frame[..., ::-1]  # Reverse channels: BGR -> RGB
+                            video_frames.append(frame)
+
+                        if done:
+                            break
 
                     if store_video_this_rollout:
-                        video_frames.append(obs['agentview_image'])
+                        for frame in video_frames:
+                            video_writer.write(frame)
+                        video_writer.release()
 
-                if done:
-                    break
-
-                if store_video_this_rollout:
-                    for frame in video_frames:
-                        video_writer.write(frame)
-                    video_writer.release()
-
-                # a new form of success record
-                num_success += int(done)
+                    # a new form of success record
+                    num_success += int(done)
+                except Exception as e:
+                    import traceback
+                    error_msg = f"Error during rollout {i} of task {task_str}: {e}"
+                    error_traceback = traceback.format_exc()
+                    # Use print and tqdm.write to ensure error messages are visible
+                    print(f"\n{'='*60}")
+                    print(f"ERROR: {error_msg}")
+                    print(f"{'='*60}")
+                    print(error_traceback)
+                    print(f"{'='*60}\n")
+                    # Also log to logger
+                    log_print.error(error_msg)
+                    log_print.error(error_traceback)
+                    # Continue to next rollout even if this one failed
+                    continue
 
         success_rate = num_success / self.n_eval
+        
+        # Restore original encoder forward if it was wrapped
+        if encoder is not None and original_encoder_forward is not None:
+            encoder.forward = original_encoder_forward
+        
         env.close()
         gc.collect()
         return success_rate
@@ -298,23 +411,26 @@ class EvaluateLibero:
         self.cfg.policy.language_encoder = OmegaConf.create()
         self.cfg.policy.language_encoder.network_kwargs = OmegaConf.create()
 
-        # Create simple task embeddings to avoid transformers issues
+        # Create task embeddings - same as training: use get_task_embs
+        # If that fails, fall back to 2-dim random embeddings
         import torch
         num_tasks = len(self.descriptions)
-        if task_embedding_format == "one-hot":
-            task_embs = []
-            for i in range(num_tasks):
-                emb = torch.zeros(num_tasks, device=self.device)
-                emb[i] = 1.0
-                task_embs.append(emb)
+        
+        try:
+            # Use get_task_embs same as training (libero_dataset.py line 147)
+            task_embs = get_task_embs(self.cfg, self.descriptions)
             self.task_embs = task_embs
+            print(f"Created {num_tasks} {task_embedding_format} task embeddings using get_task_embs (dim={task_embs[0].shape[0]})")
             return
-        else:
+        except Exception as e:
+            print(f"Warning: Failed to load task embeddings using get_task_embs: {e}")
+            print("Falling back to 2-dim random embeddings")
             task_embs = []
             for i in range(num_tasks):
-                emb = torch.randn(768, device=self.device)
+                emb = torch.randn(2, device=self.device)
                 task_embs.append(emb)
             self.task_embs = task_embs
+            print(f"Created {num_tasks} random task embeddings (dim=2)")
             return
 
 
@@ -352,15 +468,16 @@ class EvaluateLibero:
 
         goal = {}
         goal['lang_text'] = lang_text
+        goal['lang'] = lang_embed
         # Ensure lang_embed is on the correct device
-        if isinstance(lang_embed, torch.Tensor):
-            goal['lang'] = lang_embed.to(self.device)
-        else:
-            # If it's numpy or list, convert to tensor first
-            if isinstance(lang_embed, np.ndarray):
-                goal['lang'] = torch.from_numpy(lang_embed).to(self.device).float()
-            else:
-                goal['lang'] = torch.tensor(lang_embed, device=self.device).float()
+        # if isinstance(lang_embed, torch.Tensor):
+        #     goal['lang'] = lang_embed.to(self.device)
+        # else:
+        #     # If it's numpy or list, convert to tensor first
+        #     if isinstance(lang_embed, np.ndarray):
+        #         goal['lang'] = torch.from_numpy(lang_embed).to(self.device).float()
+        #     else:
+        #         goal['lang'] = torch.tensor(lang_embed, device=self.device).float()
 
         return return_obs, goal
 
