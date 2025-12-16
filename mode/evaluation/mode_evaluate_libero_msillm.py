@@ -14,8 +14,8 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import seed_everything
 from tqdm import tqdm
-import wandb
 import torch
+import wandb
 
 # This is for using the locally installed repo clone when using slurm
 repo_root = Path(__file__).absolute().parents[2]
@@ -83,14 +83,14 @@ class EvaluateLibero:
         self.log_dir = log_dir
 
         # Normalize device to torch.device
-        if device == "cpu" or device == "cpu":
+        if device == "cpu":
             self.device = torch.device("cpu")
         else:
-            self.device = torch.device(f"cuda:{device}")
+            self.device = torch.device(device)
         self.task_order = 0
         self.bddl_folder = get_libero_path("bddl_files")
         self.init_states_folder = get_libero_path("init_states")
-        self.task_embedding_format =task_embedding_format
+        self.task_embedding_format = task_embedding_format
         self.benchmark_name = benchmark_name
         self.benchmark_dict = benchmark.get_benchmark_dict()
         self.benchmark_instance = self.benchmark_dict[self.benchmark_name]()
@@ -105,7 +105,6 @@ class EvaluateLibero:
         self.world_size = None
         self.num_sequences = num_sequences
         self.max_steps = max_steps
-        # self.save_dir = save_dir
         self.eval_sequences = None
         self.init_states_paths = []
         self.cfg = {}
@@ -126,7 +125,6 @@ class EvaluateLibero:
         if hasattr(self, 'task_embs'):
             self.benchmark_instance.set_task_embs(self.task_embs)
         else:
-            # Fallback to get_task_embs if needed
             task_embs = get_task_embs(self.cfg, self.descriptions)
             self.benchmark_instance.set_task_embs(task_embs)
 
@@ -184,6 +182,7 @@ class EvaluateLibero:
             task_name = self.task_names[idx]
             task_i = self.benchmark_instance.get_task(idx)
             task_emb = self.benchmark_instance.task_embs[idx]
+            
             task_str = f"k{self.all_tasks[-1]}_p{idx}"
             log_print.info(f"starting to evaluate: {task_name}")
             success_rate = self.evaluate_task(model, task_i, task_emb, task_str, idx, store_video=store_video)
@@ -220,72 +219,72 @@ class EvaluateLibero:
         )
         init_states = torch.load(init_states_path)
         num_success = 0
-        for i in tqdm(range(self.n_eval), desc="Evaluating"):
-            store_video_this_rollout = i < store_video
-            if store_video_this_rollout:
-                video_frames = []
-                video_filename = f"rollout_{task_str}_nmp_{i}.mp4"
-                video_path = os.path.join(self.log_dir, video_filename)
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
-                video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
-
-            env.reset()
-
-            done = False
-            steps = 0
-            model.reset()
-
-            # Use per-rollout init state if a list is provided
-            state = init_states
-            if isinstance(init_states, (list, tuple)):
-                state = init_states[i % len(init_states)]
-
-            # Some saved init states are numpy arrays that do not match MuJoCo's expected (MjData, float) signature.
-            # To avoid type errors during evaluation, always fall back to a clean reset.
-            try:
-                obs = env.reset()
-            except Exception as e:
-                log_print.warning(f"env.reset() failed on rollout {i}: {e}; retrying after short sleep")
-                time.sleep(1)
-                obs = env.reset()
-
-            # dummy actions [env_num, 7] all zeros for initial physics simulation
-            dummy = np.zeros(7)
-            for _ in range(5):
-                obs, _, _, _ = env.step(dummy)
-
-            if task_str != "":
-                sim_state = env.get_sim_state()
-                if sim_states is not None:
-                    sim_states[i].append(sim_state)
-
-            while steps < self.max_steps:
-                steps += 1
-                data, goal = self.process_env_obs(obs, task_emb, task_i.language)
-                # data = raw_obs_to_tensor_obs(obs, task_emb, cfg)
-                actions = model.step(data, goal)
-                actions = actions.cpu().numpy()
-                obs, reward, done, info = env.step(actions)
-
+        # Inference-only evaluation
+        with torch.inference_mode():
+            for i in tqdm(range(self.n_eval), desc="Evaluating"):
+                store_video_this_rollout = i < store_video
                 if store_video_this_rollout:
-                    video_frames.append(obs['agentview_image'])
+                    video_frames = []
+                    video_filename = f"rollout_{task_str}_nmp_{i}.mp4"
+                    video_path = os.path.join(self.log_dir, video_filename)
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
+                    video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
+
+                env.reset()
+
+                done = False
+                steps = 0
+                model.reset()
+
+                # Use per-rollout init state if a list is provided
+                state = init_states
+                if isinstance(init_states, (list, tuple)):
+                    state = init_states[i % len(init_states)]
+
+                # Some saved init states are numpy arrays that do not match MuJoCo's expected (MjData, float) signature.
+                # To avoid type errors during evaluation, always fall back to a clean reset.
+                try:
+                    obs = env.reset()
+                except Exception as e:
+                    log_print.warning(f"env.reset() failed on rollout {i}: {e}; retrying after short sleep")
+                    time.sleep(1)
+                    obs = env.reset()
+
+                # dummy actions [env_num, 7] all zeros for initial physics simulation
+                dummy = np.zeros(7)
+                for _ in range(5):
+                    obs, _, _, _ = env.step(dummy)
+
+                if task_str != "":
+                    sim_state = env.get_sim_state()
+                    if sim_states is not None:
+                        sim_states[i].append(sim_state)
+
+                while steps < self.max_steps:
+                    steps += 1
+
+                    data, goal = self.process_env_obs(obs, task_emb, task_i.language)
+                    actions = model.step(data, goal)
+                    actions = actions.cpu().numpy()
+                    obs, reward, done, info = env.step(actions)
+
+                    if store_video_this_rollout:
+                        video_frames.append(obs['agentview_image'])
 
                 if done:
                     break
 
-            if store_video_this_rollout:
-                for frame in video_frames:
-                    video_writer.write(frame)
-                video_writer.release()
+                if store_video_this_rollout:
+                    for frame in video_frames:
+                        video_writer.write(frame)
+                    video_writer.release()
 
-            # a new form of success record
-            num_success += int(done)
-
+                # a new form of success record
+                num_success += int(done)
 
         success_rate = num_success / self.n_eval
         env.close()
         gc.collect()
-        # print(f"[info] evaluate task {task_str} takes {t.get_elapsed_time():.1f} seconds")
         return success_rate
 
     def create_cfg_for_libero(self, task_embedding_format):
@@ -303,19 +302,17 @@ class EvaluateLibero:
         import torch
         num_tasks = len(self.descriptions)
         if task_embedding_format == "one-hot":
-            # Simple one-hot embeddings
             task_embs = []
             for i in range(num_tasks):
-                emb = torch.zeros(num_tasks)
+                emb = torch.zeros(num_tasks, device=self.device)
                 emb[i] = 1.0
                 task_embs.append(emb)
             self.task_embs = task_embs
-            return  # Skip get_task_embs call
+            return
         else:
-            # For other formats, we'll need to implement simple versions
             task_embs = []
             for i in range(num_tasks):
-                emb = torch.randn(768)  # Standard embedding size
+                emb = torch.randn(768, device=self.device)
                 task_embs.append(emb)
             self.task_embs = task_embs
             return
@@ -355,7 +352,15 @@ class EvaluateLibero:
 
         goal = {}
         goal['lang_text'] = lang_text
-        goal['lang'] = lang_embed
+        # Ensure lang_embed is on the correct device
+        if isinstance(lang_embed, torch.Tensor):
+            goal['lang'] = lang_embed.to(self.device)
+        else:
+            # If it's numpy or list, convert to tensor first
+            if isinstance(lang_embed, np.ndarray):
+                goal['lang'] = torch.from_numpy(lang_embed).to(self.device).float()
+            else:
+                goal['lang'] = torch.tensor(lang_embed, device=self.device).float()
 
         return return_obs, goal
 
@@ -363,7 +368,7 @@ class EvaluateLibero:
 def main(cfg: DictConfig):
     seed_everything(0, workers=True)
     
-    # Handle checkpoint path from environment variable if provided (useful when filename contains '=' which breaks Hydra parsing)
+    # Handle checkpoint path from environment variable if provided
     checkpoint_env = os.environ.get("CHECKPOINT_PATH")
     if checkpoint_env:
         print(f"Using checkpoint from environment variable: {checkpoint_env}")
@@ -392,24 +397,23 @@ def main(cfg: DictConfig):
     # But Hydra already created the directory, so we'll work with what we have
     # and ensure log_dir uses the checkpoint-based name
     
-    # Handle CUDA_VISIBLE_DEVICES mapping
+    # Handle CUDA_VISIBLE_DEVICES properly for torch device selection
+    # When CUDA_VISIBLE_DEVICES is set, physical GPU N becomes logical GPU 0 (for CUDA).
+    # So we always use cuda:0 when CUDA_VISIBLE_DEVICES is set.
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda_visible:
-        visible = [g.strip() for g in cuda_visible.split(",") if g.strip() != ""]
-        mapped_max = len(visible) - 1
-        if len(visible) == 0:
-            raise RuntimeError("CUDA_VISIBLE_DEVICES is set but parsed to empty list.")
-        if cfg.device <= mapped_max:
-            device_id = cfg.device
-        else:
-            print(f"Requested device {cfg.device} but only {len(visible)} visible; falling back to 0")
-            device_id = 0
-        physical = visible[device_id]
-        print(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, using device {device_id} (maps to physical GPU {physical})")
+        device_id = 0  # Logical GPU 0 (maps to physical GPU specified in CUDA_VISIBLE_DEVICES)
+        device_str = "cuda:0"
     else:
-        device_id = cfg.device
-        print(f"No CUDA_VISIBLE_DEVICES set, using device {device_id} (absolute index)")
-
+        # Use cfg.device if available, otherwise default to cuda:0
+        device_id = getattr(cfg, 'device', 0)
+        if isinstance(device_id, str):
+            device_str = device_id
+        else:
+            device_str = f"cuda:{device_id}"
+    
+    print(f"Using device: {device_str} (CUDA_VISIBLE_DEVICES={cuda_visible})")
+    
     # Load model using utility function (handles MS-ILLM automatically)
     model, _, dm, _, loaded_cfg = get_msillm_mode_and_env(
         cfg.train_folder,
@@ -421,8 +425,7 @@ def main(cfg: DictConfig):
         device_id=device_id,
         prep_dm_and_deps=False
     )
-
-    model = model.to(f"cuda:{device_id}")
+    
     model.eval()
 
     # Get log directory based on checkpoint name (without extension)
@@ -451,15 +454,48 @@ def main(cfg: DictConfig):
         max_steps=cfg.max_steps,
         n_eval=cfg.n_eval,
         task_embedding_format=cfg.task_embedding_format,
-        device=device_id,
+        device=device_str,
     )
 
+    # Setup wandb logger
     if cfg.log_wandb:
-        os.makedirs(log_dir / "wandb", exist_ok=False)
+        os.makedirs(log_dir / "wandb", exist_ok=True)
+        checkpoint_stem = Path(cfg.checkpoint).stem
+        # Resolve interpolations before converting to dict for wandb config
+        wandb_config = {
+            "checkpoint": cfg.checkpoint,
+            "benchmark_name": cfg.benchmark_name,
+            "num_sequences": cfg.num_sequences,
+            "n_eval": cfg.n_eval,
+            "max_steps": cfg.max_steps,
+        }
+
+        # Backward/forward compatible wandb config:
+        # - Some configs provide `logger.*`
+        # - Older configs provide `wandb_entity` only (no `logger` key, often with struct mode enabled)
+        project = OmegaConf.select(cfg, "logger.project", default=None) or "mode_libero_eval"
+        group = OmegaConf.select(cfg, "logger.group", default=None) or "mode_libero_eval"
+        mode = OmegaConf.select(cfg, "logger.mode", default=None) or "online"
+        run_id = OmegaConf.select(cfg, "logger.id", default=None)
+        entity = OmegaConf.select(cfg, "logger.entity", default=None)
+        if entity in ("null", "", None):
+            # legacy key
+            entity = cfg.get("wandb_entity", None)
+            if entity in ("null", ""):
+                entity = None
+        if run_id in ("null", ""):
+            run_id = None
+
         run = wandb.init(
-            project='mode_libero_eval',
-            entity=cfg.wandb_entity,
-            config=OmegaConf.to_container(cfg, resolve=True),
+            project=project,
+            entity=entity,
+            name=checkpoint_stem,
+            group=group,
+            config=wandb_config,
+            dir=str(log_dir / "wandb"),
+            mode=mode,
+            id=run_id,
+            allow_val_change=True,
         )
 
     # Actually run the evaluation!
@@ -469,8 +505,8 @@ def main(cfg: DictConfig):
     eval_libero.setup()
     eval_libero.start()
 
-    if cfg.log_wandb:
-        run.finish()
+    if cfg.log_wandb and wandb.run is not None:
+        wandb.finish()
     
     print("\n" + "="*50)
     print("Evaluation completed!")

@@ -16,7 +16,21 @@ num_videos: 1
 debug: False
 
 log_wandb: True
-wandb_entity: khj20343
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
+
+# MuJoCo / EGL rendering config
+# If CUDA illegal memory access persists and you see EGL errors, set `mujoco_egl_device_id`
+# to the physical GPU index (as shown in `nvidia-smi -L`), and/or set `mujoco_gl: osmesa`
+# to force CPU rendering for debugging.
+mujoco_gl: egl
+mujoco_egl_device_id: null
+egl_device_id: null
+
+# CUDA debug knobs (do NOT change model architecture; only affects execution/scheduling)
+cuda_debug:
+  deterministic: false   # uses deterministic algorithms when possible
+  disable_tf32: false    # disable TF32 matmul (changes kernel choice)
+  sync_each_step: false  # add torch.cuda.synchronize() after model.step/env.step to localize async errors
 
 num_sampling_steps: null
 sampler_type: null
