@@ -47,7 +47,13 @@ def get_libero_path(query_key):
     assert (
         query_key in config
     ), f"Key {query_key} not found in config file {config_file}. You need to modify it. Available keys are: {config.keys()}"
-    return config[query_key]
+    
+    result_path = config[query_key]
+    
+    # Normalize path to handle trailing slashes and ensure consistency
+    result_path = os.path.normpath(result_path)
+    
+    return result_path
 
 
 def set_libero_default_path(custom_location=os.path.dirname(os.path.abspath(__file__))):

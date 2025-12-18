@@ -11,8 +11,8 @@ eval_cfg_overwrite:
     num_sampling_steps: 10
 
 train_folder: /home/hjkim/MoDE_Diffusion_Policy/saved_models
-checkpoint: msillm-NeuralCompression_main-msillm_quality_vlo1_epoch19.ckpt
-device: 4
+checkpoint: "mbreuss/MoDE_LIBERO_10"
+device: 0
 
 log_dir: /home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval
 dataset_path: /tmp
@@ -20,7 +20,7 @@ num_videos: 30
 debug: False
 
 log_wandb: True
-wandb_entity: omeryagmurlu
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
 
 num_sampling_steps: null
 sampler_type: null
@@ -31,7 +31,7 @@ noise_scheduler: null
 
 num_sequences: 50
 max_steps: 520
-n_eval: 20
+n_eval: 50
 task_embedding_format: clip
 
-benchmark_name: libero_90 # [LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_90, LIBERO_10]
+benchmark_name: libero_10 # [LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_90, LIBERO_10]

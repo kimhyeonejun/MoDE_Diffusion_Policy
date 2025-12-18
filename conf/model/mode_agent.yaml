@@ -47,7 +47,7 @@ model:
     _target_: mode.models.networks.modedit.MoDeDiT
     action_dim: ${datamodule.action_space}
     goal_dim: ${model.cond_dim}
-    obs_dim: 2048
+    obs_dim: ${obs_dim}
     goal_conditioned: True
     causal: True
     use_custom_attn_mask: False

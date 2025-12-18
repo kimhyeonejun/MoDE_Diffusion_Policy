@@ -21,7 +21,7 @@ clip_lang_model_name: ViT-B/32
 log_dir: ./logs
 slurm: false
 future_range: 29
-seed: 42
+seed: 242
 # Resume from specific checkpoint (optional)
 resume_from_checkpoint: null  # Set to path like: saved_models/msillm-xxx_epoch=epoch=19.ckpt
 device: 'cuda'

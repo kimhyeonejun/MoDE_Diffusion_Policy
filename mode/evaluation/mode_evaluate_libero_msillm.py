@@ -46,6 +46,43 @@ from libero.lifelong.utils import (get_task_embs, safe_device, create_experiment
 
 log_print = logging.getLogger(__name__)
 
+def get_action_stats(dm):
+    action_mean = None
+    action_std = None
+    try:
+        if hasattr(dm, 'train_datasets') and 'lang' in dm.train_datasets:
+            concat_ds = dm.train_datasets['lang']
+            print(f"[DEBUG] Inspecting Dataset for Action Stats...")
+            if hasattr(concat_ds, 'datasets') and len(concat_ds.datasets) > 0:
+                first_ds = concat_ds.datasets[0]
+                if hasattr(first_ds, 'transforms'):
+                    transforms = first_ds.transforms
+                    print(f"[DEBUG] Transforms keys: {transforms.keys()}")
+                    if 'actions' in transforms:
+                        action_transforms = transforms['actions']
+                        print(f"[DEBUG] Action Transforms: {action_transforms}")
+                        
+                        # Handle Compose or List
+                        transforms_list = []
+                        if isinstance(action_transforms, (list, tuple)):
+                            transforms_list = action_transforms
+                        elif hasattr(action_transforms, 'transforms'): # torchvision.transforms.Compose
+                            transforms_list = action_transforms.transforms
+                        else:
+                            transforms_list = [action_transforms]
+                            
+                        for t in transforms_list:
+                            print(f"[DEBUG] Checking transform: {type(t).__name__}")
+                            if 'NormalizeVector' in type(t).__name__:
+                                action_mean = t.mean.numpy()
+                                action_std = t.std.numpy()
+                                print(f"[DEBUG] FOUND NormalizeVector! mean={action_mean}, std={action_std}")
+    except Exception as e:
+        print(f"Error checking action stats: {e}")
+        import traceback
+        traceback.print_exc()
+    return action_mean, action_std
+
 def get_log_dir(log_dir, checkpoint_name=None):
     # Use checkpoint-based directory if checkpoint name is provided
     if checkpoint_name:
@@ -82,6 +119,7 @@ class EvaluateLibero:
         n_eval,
         task_embedding_format,
         device,
+        action_stats=(None, None),
     ):
         self.model = model
         self.transforms = transforms
@@ -114,6 +152,7 @@ class EvaluateLibero:
         self.init_states_paths = []
         self.cfg = {}
         self.descriptions = []
+        self.action_mean, self.action_std = action_stats
         
         # BPP statistics tracking
         self.bpp_stats = {}
@@ -269,126 +308,122 @@ class EvaluateLibero:
         init_states_path = os.path.join(
             self.init_states_folder, task_i.problem_folder, task_i.init_states_file
         )
-        init_states = torch.load(init_states_path)
+        init_states = torch.load(init_states_path, weights_only=False)
         num_success = 0
         # Inference-only evaluation
         with torch.inference_mode():
             for i in tqdm(range(self.n_eval), desc="Evaluating"):
-                try:
-                    store_video_this_rollout = i < store_video
+                store_video_this_rollout = i < store_video
+                if store_video_this_rollout:
+                    video_frames = []
+                    video_filename = f"rollout_{task_str}_nmp_{i}.mp4"
+                    video_path = os.path.join(self.log_dir, video_filename)
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
+                    video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
+
+                env.reset()
+
+                done = False
+                steps = 0
+                model.reset()
+                # Select one init state for this rollout (same as LIBERO's metric.py)
+                init_state_idx = i % init_states.shape[0]
+                init_state = init_states[init_state_idx]
+                obs = env.set_init_state(init_state)
+
+                # dummy actions [env_num, 7] all zeros for initial physics simulation
+                dummy = np.zeros(7)
+                for _ in range(5):
+                    obs, _, _, _ = env.step(dummy)
+
+                if task_str != "":
+                    sim_state = env.get_sim_state()
+                    if sim_states is not None:
+                        sim_states[i].append(sim_state)
+
+                while steps < self.max_steps:
+                    steps += 1
+
+                    data, goal = self.process_env_obs(obs, task_emb, task_i.language)
+                    
+                    # [DIAGNOSTIC] Check data statistics once per task
+                    if i == 0 and steps == 1:
+                        print(f"\n[DIAGNOSTIC] Rollout {i} Step {steps} Data Stats:")
+                        for k, v in data['rgb_obs'].items():
+                            print(f"  {k}: shape={v.shape}, min={v.min():.4f}, max={v.max():.4f}, mean={v.mean():.4f}")
+                        if 'lang' in goal and isinstance(goal['lang'], torch.Tensor):
+                            v = goal['lang']
+                            print(f"  goal['lang']: shape={v.shape}, min={v.min():.4f}, max={v.max():.4f}, mean={v.mean():.4f}")
+                        if 'lang_text' in goal:
+                            print(f"  goal['lang_text']: {goal['lang_text']}")
+                    
+                    # Clear captured latents for this step
+                    if encoder is not None and hasattr(encoder.forward, 'latents'):
+                        encoder.forward.latents = []
+                        encoder.forward.call_count = 0
+                    
+                    actions = model.step(data, goal)
+                    
+                    # Calculate BPP from captured latents (compression happened in model.step)
+                    if encoder is not None and hasattr(encoder.forward, 'latents') and len(encoder.forward.latents) > 0:
+                        bpp_dict = {}
+                        # encoder.forward.latents contains latents in order: [rgb_static_latent, rgb_gripper_latent]
+                        # Each latent corresponds to one image after reshape to (b*t, c, h, w)
+                        keys = ['rgb_static', 'rgb_gripper']
+                        for idx_latent, key in enumerate(keys):
+                            if idx_latent < len(encoder.forward.latents):
+                                latent = encoder.forward.latents[idx_latent]
+                                # Get original image shape from data
+                                if key in data.get('rgb_obs', {}):
+                                    img = data['rgb_obs'][key]  # (1, C, H, W)
+                                    # Remove batch dim for BPP calculation
+                                    img_for_bpp = img.squeeze(0)  # (C, H, W)
+                                    
+                                    # Calculate BPP
+                                    bpp = calculate_bpp_from_encoder_output(
+                                        latent,
+                                        img_for_bpp,
+                                        bits_per_element=8,  # Assuming 8-bit quantization
+                                    )
+                                    bpp_dict[key] = bpp
+                        
+                        # Accumulate BPP statistics
+                        if bpp_dict:
+                            self.bpp_stats = accumulate_bpp_stats(bpp_dict, self.bpp_stats)
+                    
+                    actions = actions.cpu().numpy()
+                    
+                    # Apply action denormalization if stats exist
+                    if self.action_mean is not None and self.action_std is not None:
+                        actions = actions * self.action_std + self.action_mean
+                    
+                    # [DIAGNOSTIC] Check action statistics
+                    if i == 0 and steps == 1:
+                        print(f"[DIAGNOSTIC] Model Output Actions (Post-Processing):")
+                        print(f"  actions: shape={actions.shape}, min={actions.min():.4f}, max={actions.max():.4f}, mean={actions.mean():.4f}")
+                        print(f"  First action: {actions[0] if len(actions.shape)>1 else actions}")
+                        print("-" * 40)
+                    
+                    obs, reward, done, info = env.step(actions)
+
                     if store_video_this_rollout:
-                        video_frames = []
-                        video_filename = f"rollout_{task_str}_nmp_{i}.mp4"
-                        video_path = os.path.join(self.log_dir, video_filename)
-                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
-                        video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
+                        frame = obs['agentview_image']
+                        # Fix: Rotate 180 degrees and convert RGB to BGR for cv2
+                        if isinstance(frame, np.ndarray):
+                            frame = np.rot90(frame, k=2, axes=(0, 1))
+                            frame = frame[..., ::-1]
+                        video_frames.append(frame)
 
-                    env.reset()
+                    if done:
+                        break
 
-                    done = False
-                    steps = 0
-                    model.reset()
+                if store_video_this_rollout:
+                    for frame in video_frames:
+                        video_writer.write(frame)
+                    video_writer.release()
 
-                    # Use per-rollout init state if a list is provided
-                    state = init_states
-                    if isinstance(init_states, (list, tuple)):
-                        state = init_states[i % len(init_states)]
-
-                    # Some saved init states are numpy arrays that do not match MuJoCo's expected (MjData, float) signature.
-                    # To avoid type errors during evaluation, always fall back to a clean reset.
-                    try:
-                        obs = env.reset()
-                    except Exception as e:
-                        log_print.warning(f"env.reset() failed on rollout {i}: {e}; retrying after short sleep")
-                        time.sleep(1)
-                        obs = env.reset()
-
-                    # dummy actions [env_num, 7] all zeros for initial physics simulation
-                    dummy = np.zeros(7)
-                    for _ in range(5):
-                        obs, _, _, _ = env.step(dummy)
-
-                    if task_str != "":
-                        sim_state = env.get_sim_state()
-                        if sim_states is not None:
-                            sim_states[i].append(sim_state)
-
-                    while steps < self.max_steps:
-                        steps += 1
-
-                        data, goal = self.process_env_obs(obs, task_emb, task_i.language)
-                        
-                        # Clear captured latents for this step
-                        if encoder is not None and hasattr(encoder.forward, 'latents'):
-                            encoder.forward.latents = []
-                            encoder.forward.call_count = 0
-                        
-                        actions = model.step(data, goal)
-                        
-                        # Calculate BPP from captured latents (compression happened in model.step)
-                        if encoder is not None and hasattr(encoder.forward, 'latents') and len(encoder.forward.latents) > 0:
-                            bpp_dict = {}
-                            # encoder.forward.latents contains latents in order: [rgb_static_latent, rgb_gripper_latent]
-                            # Each latent corresponds to one image after reshape to (b*t, c, h, w)
-                            keys = ['rgb_static', 'rgb_gripper']
-                            for idx_latent, key in enumerate(keys):
-                                if idx_latent < len(encoder.forward.latents):
-                                    latent = encoder.forward.latents[idx_latent]
-                                    # Get original image shape from data
-                                    if key in data.get('rgb_obs', {}):
-                                        img = data['rgb_obs'][key]  # (1, C, H, W)
-                                        # Remove batch dim for BPP calculation
-                                        img_for_bpp = img.squeeze(0)  # (C, H, W)
-                                        
-                                        # Calculate BPP
-                                        bpp = calculate_bpp_from_encoder_output(
-                                            latent,
-                                            img_for_bpp,
-                                            bits_per_element=8,  # Assuming 8-bit quantization
-                                        )
-                                        bpp_dict[key] = bpp
-                            
-                            # Accumulate BPP statistics
-                            if bpp_dict:
-                                self.bpp_stats = accumulate_bpp_stats(bpp_dict, self.bpp_stats)
-                        
-                        actions = actions.cpu().numpy()
-                        obs, reward, done, info = env.step(actions)
-
-                        if store_video_this_rollout:
-                            frame = obs['agentview_image']
-                            # Fix: Rotate 180 degrees and convert BGR to RGB
-                            # Rotate 180 degrees on height and width axes
-                            frame = np.rot90(frame, k=2, axes=(0, 1))  # Rotate on h, w axes
-                            # Convert BGR to RGB by reversing the channel dimension
-                            frame = frame[..., ::-1]  # Reverse channels: BGR -> RGB
-                            video_frames.append(frame)
-
-                        if done:
-                            break
-
-                    if store_video_this_rollout:
-                        for frame in video_frames:
-                            video_writer.write(frame)
-                        video_writer.release()
-
-                    # a new form of success record
-                    num_success += int(done)
-                except Exception as e:
-                    import traceback
-                    error_msg = f"Error during rollout {i} of task {task_str}: {e}"
-                    error_traceback = traceback.format_exc()
-                    # Use print and tqdm.write to ensure error messages are visible
-                    print(f"\n{'='*60}")
-                    print(f"ERROR: {error_msg}")
-                    print(f"{'='*60}")
-                    print(error_traceback)
-                    print(f"{'='*60}\n")
-                    # Also log to logger
-                    log_print.error(error_msg)
-                    log_print.error(error_traceback)
-                    # Continue to next rollout even if this one failed
-                    continue
+                # a new form of success record
+                num_success += int(done)
 
         success_rate = num_success / self.n_eval
         
@@ -412,26 +447,14 @@ class EvaluateLibero:
         self.cfg.policy.language_encoder.network_kwargs = OmegaConf.create()
 
         # Create task embeddings - same as training: use get_task_embs
-        # If that fails, fall back to 2-dim random embeddings
         import torch
         num_tasks = len(self.descriptions)
         
-        try:
-            # Use get_task_embs same as training (libero_dataset.py line 147)
-            task_embs = get_task_embs(self.cfg, self.descriptions)
-            self.task_embs = task_embs
-            print(f"Created {num_tasks} {task_embedding_format} task embeddings using get_task_embs (dim={task_embs[0].shape[0]})")
-            return
-        except Exception as e:
-            print(f"Warning: Failed to load task embeddings using get_task_embs: {e}")
-            print("Falling back to 2-dim random embeddings")
-            task_embs = []
-            for i in range(num_tasks):
-                emb = torch.randn(2, device=self.device)
-                task_embs.append(emb)
-            self.task_embs = task_embs
-            print(f"Created {num_tasks} random task embeddings (dim=2)")
-            return
+        # Use get_task_embs same as training (libero_dataset.py line 147)
+        task_embs = get_task_embs(self.cfg, self.descriptions)
+        self.task_embs = task_embs
+        print(f"Created {num_tasks} {task_embedding_format} task embeddings using get_task_embs (dim={task_embs[0].shape[0]})")
+        return
 
 
     def translate_obs_space(self, obs_space):
@@ -448,17 +471,42 @@ class EvaluateLibero:
 
     def apply_transforms(self, data, train=False):
         # Assuming data contains images in 'rgb_static' and 'rgb_gripper'
+        # Manual preprocessing to ensure correctness
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(self.device)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(self.device)
+
         for key in data['rgb_obs']:
-            # print(key)
+            # Get the image data
             x = data['rgb_obs'][key]
+            
+            # [CORRECTION] Do NOT rotate for model input.
+            # The model was trained on raw (likely inverted) images.
+            # Rotation is only for video saving.
+            
             if len(x.shape) == 3:
                 x = np.expand_dims(x, axis=0)
-                # print(x.shape)
-            x = torch.from_numpy(x).byte().permute(0, 3, 1, 2)
-            for transform in self.transforms[key]:
-                x = transform(x)
-            data['rgb_obs'][key] = x.unsqueeze(0).to(self.device)
-            # data['rgb_obs'][key] = transforms[key](data['rgb_obs'][key])
+            
+            # 1. Convert to tensor, float, permute
+            x = torch.from_numpy(x).float().permute(0, 3, 1, 2).to(self.device)
+            
+            # 2. Scale to 0-1
+            x = x / 255.0
+            
+            # 3. Resize if needed
+            # rgb_static: 224x224 (env default)
+            # rgb_gripper: 112x112 (from config)
+            if key == 'rgb_gripper':
+                x = torch.nn.functional.interpolate(x, size=(112, 112), mode='bilinear', align_corners=False)
+            elif key == 'rgb_static':
+                # Ensure 224x224 just in case
+                if x.shape[-1] != 224 or x.shape[-2] != 224:
+                    x = torch.nn.functional.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+            
+            # 4. Normalize
+            x = (x - mean) / std
+            
+            # Add batch dimension (B, T, C, H, W) -> here T=1
+            data['rgb_obs'][key] = x.unsqueeze(0)
 
         return data
 
@@ -467,7 +515,14 @@ class EvaluateLibero:
         return_obs = self.apply_transforms(return_obs)
 
         goal = {}
-        goal['lang_text'] = lang_text
+        # Ensure lang_text is a list (lang_buffer expects list)
+        if lang_text is not None:
+            if isinstance(lang_text, str):
+                goal['lang_text'] = [lang_text]
+            else:
+                goal['lang_text'] = lang_text
+        else:
+            goal['lang_text'] = None
         goal['lang'] = lang_embed
         # Ensure lang_embed is on the correct device
         # if isinstance(lang_embed, torch.Tensor):
@@ -543,6 +598,133 @@ def main(cfg: DictConfig):
         prep_dm_and_deps=False
     )
     
+    # Ensure DataModule is setup to load statistics (action normalization, etc.)
+    if not hasattr(dm, 'train_datasets') or not dm.train_datasets:
+        dm.setup()
+    
+    # -------------------------------------------------------------------------
+    # [DIAGNOSTIC] Verify if inner_model weights are correctly loaded
+    # -------------------------------------------------------------------------
+    print("\n" + "!"*60)
+    print("[DIAGNOSTIC] Verifying inner_model weights loading...")
+    
+    try:
+        # 1. Identify checkpoint file
+        if "=" in cfg.checkpoint:
+             sanitized_checkpoint = cfg.checkpoint.replace("=", "-")
+             ckpt_path = Path(cfg.train_folder) / sanitized_checkpoint
+             if not ckpt_path.exists():
+                 ckpt_path = Path(cfg.train_folder) / cfg.checkpoint
+        else:
+             ckpt_path = Path(cfg.train_folder) / cfg.checkpoint
+             
+        # Handle Hugging Face cache path if needed (simplified check)
+        if not ckpt_path.exists():
+            # Try to find it in HF cache if it's a repo ID
+            from huggingface_hub import try_to_load_from_cache
+            if "/" in cfg.checkpoint: # Likely a repo ID
+                cached_path = try_to_load_from_cache(cfg.checkpoint, "model_cleaned.safetensors")
+                if cached_path:
+                    ckpt_path = Path(cached_path)
+        
+        print(f"Inspecting checkpoint: {ckpt_path}")
+        
+        # 2. Load raw state_dict from file
+        loaded_state_dict = None
+        if str(ckpt_path).endswith('.safetensors'):
+            from safetensors.torch import load_file
+            loaded_state_dict = load_file(ckpt_path)
+        elif str(ckpt_path).endswith('.ckpt'):
+            loaded_state_dict = torch.load(ckpt_path, map_location='cpu')['state_dict']
+        elif str(ckpt_path).endswith('.pt'):
+            loaded_state_dict = torch.load(ckpt_path, map_location='cpu')
+            if 'state_dict' in loaded_state_dict:
+                loaded_state_dict = loaded_state_dict['state_dict']
+        
+        if loaded_state_dict:
+            # 3. Find an inner_model key
+            sample_key = None
+            sample_val_file = None
+            
+            # Common patterns for inner_model keys
+            patterns = ["model.inner_model.", "inner_model."]
+            
+            for k, v in loaded_state_dict.items():
+                for p in patterns:
+                    if p in k and "weight" in k and v.numel() > 100: # Check weights, not scalars
+                        sample_key = k
+                        sample_val_file = v
+                        break
+                if sample_key: break
+            
+            if sample_key:
+                print(f"Found sample key in file: {sample_key}")
+                
+                # 4. Find corresponding parameter in loaded model
+                # Map file key to model key
+                # Case A: File has 'inner_model.', Model expects 'model.inner_model.'
+                # Case B: File has 'model.inner_model.', Model expects 'model.inner_model.'
+                
+                # We need to find this parameter in model.named_parameters()
+                model_param = None
+                model_param_name = None
+                
+                # Heuristic mapping
+                search_suffix = sample_key.split("inner_model.")[-1] # e.g. "blocks.0.attn.qkv.weight"
+                
+                for name, param in model.named_parameters():
+                    if name.endswith(search_suffix):
+                        model_param = param
+                        model_param_name = name
+                        break
+                
+                if model_param is not None:
+                    print(f"Corresponding model parameter: {model_param_name}")
+                    
+                    # 5. Compare values
+                    # Move file tensor to same device/dtype for comparison
+                    val_file = sample_val_file.to(model_param.device).to(model_param.dtype)
+                    val_model = model_param.data
+                    
+                    if torch.allclose(val_file, val_model, atol=1e-5):
+                        print(f"✅ SUCCESS: Values MATCH! (First 5 params: {val_model.flatten()[:5]})")
+                    else:
+                        print(f"❌ FAILURE: Values MISMATCH!")
+                        print(f"  File:  {val_file.flatten()[:5]}")
+                        print(f"  Model: {val_model.flatten()[:5]}")
+                        print(f"  Difference norm: {(val_file - val_model).norm().item()}")
+                else:
+                    print(f"❌ Could not find corresponding parameter in model for {sample_key}")
+                    print("Available model keys (first 10):")
+                    for i, (n, _) in enumerate(model.named_parameters()):
+                        if i >= 10: break
+                        print(f"  {n}")
+            else:
+                print("❌ Could not find any 'inner_model' keys in the checkpoint file.")
+                print("Keys in checkpoint (first 10):", list(loaded_state_dict.keys())[:10])
+        else:
+            print("❌ Failed to load state_dict from checkpoint file.")
+            
+    except Exception as e:
+        print(f"⚠️ Diagnostic check failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        
+    print("!"*60 + "\n")
+    # -------------------------------------------------------------------------
+    
+    # -------------------------------------------------------------------------
+    # Check for Action Normalization
+    # -------------------------------------------------------------------------
+    action_mean, action_std = get_action_stats(dm)
+    if action_mean is not None:
+        print(f"[INFO] Found Action Normalization stats!")
+        print(f"  Mean: {action_mean}")
+        print(f"  Std: {action_std}")
+    else:
+        print("[INFO] No Action Normalization stats found. Assuming raw actions.")
+    # -------------------------------------------------------------------------
+    
     model.eval()
 
     # Get log directory based on checkpoint name (without extension)
@@ -572,6 +754,7 @@ def main(cfg: DictConfig):
         n_eval=cfg.n_eval,
         task_embedding_format=cfg.task_embedding_format,
         device=device_str,
+        action_stats=(action_mean, action_std)
     )
 
     # Setup wandb logger

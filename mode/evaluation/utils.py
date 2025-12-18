@@ -197,7 +197,13 @@ def get_default_model_and_env(train_folder, dataset_path, checkpoint, env=None, 
 
 def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
     # Check if checkpoint is a Hugging Face repo ID (contains "/" and doesn't look like a file path)
-    is_hf_repo = "/" in str(checkpoint) and not Path(checkpoint).exists() and not Path(checkpoint).is_absolute()
+    checkpoint_str = str(checkpoint)
+    is_hf_repo = "/" in checkpoint_str and not Path(checkpoint_str).exists() and not Path(checkpoint_str).is_absolute()
+    
+    print(f"[get_default_mode_and_env] checkpoint: {checkpoint_str}")
+    print(f"[get_default_mode_and_env] is_hf_repo: {is_hf_repo}")
+    print(f"[get_default_mode_and_env] Path.exists(): {Path(checkpoint_str).exists()}")
+    print(f"[get_default_mode_and_env] Path.is_absolute(): {Path(checkpoint_str).is_absolute()}")
     
     if is_hf_repo:
         # Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10")
@@ -272,7 +278,7 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
                 rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
                 env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
 
-        # Instantiate model
+        # Instantiate model (same as training)
         model_cfg = cfg.model
         model_cfg_dict = OmegaConf.to_container(model_cfg, resolve=True)
         if "ckpt_path" in model_cfg_dict:
@@ -280,31 +286,106 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
         model_cfg = OmegaConf.create(model_cfg_dict)
         model = hydra.utils.instantiate(model_cfg)
         
-        # Load weights from Hugging Face
-        print(f"Loading model weights from Hugging Face: {repo_id}/{filename}")
-        ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
-        state_dict = load_file(ckpt_path)
-        
-        # Handle potential key prefixes
-        fixed_state_dict = {}
-        for k, v in state_dict.items():
-            k2 = k
-            if k2.startswith("state_dict."):
-                k2 = k2[len("state_dict."):]
-            if k2.startswith("model."):
-                k2 = k2[len("model."):]
-            fixed_state_dict[k2] = v
-        
-        missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
-        print(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
-        if missing:
-            print(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
-        if unexpected:
-            print(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+        # Load weights from Hugging Face (same as training_libero_msillm.py)
+        print(f"[get_default_mode_and_env] Loading model weights from Hugging Face: {repo_id}/{filename}")
+        try:
+            print(f"[get_default_mode_and_env] Downloading from Hugging Face hub...")
+            ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
+            print(f"[get_default_mode_and_env] Downloaded to: {ckpt_path}")
+            
+            print(f"[get_default_mode_and_env] Loading safetensors file...")
+            state_dict = load_file(ckpt_path)
+            print(f"[get_default_mode_and_env] Loaded {len(state_dict)} keys from safetensors")
+            
+            # Handle potential key prefixes (same as training)
+            # Note: Hugging Face checkpoints have 'model.' prefix removed during save (save_to_hf.py line 121)
+            # So 'inner_model.*' keys need to be mapped back to 'model.inner_model.*'
+            fixed_state_dict = {}
+            inner_model_keys_fixed = 0
+            for k, v in state_dict.items():
+                k2 = k
+                if k2.startswith("state_dict."):
+                    k2 = k2[len("state_dict."):]
+                if k2.startswith("model."):
+                    k2 = k2[len("model."):]
+                # Handle inner_model.* keys that need to be mapped to model.inner_model.*
+                # (because save_to_hf.py removes 'model.' prefix, so inner_model.* -> model.inner_model.*)
+                if k2.startswith("inner_model."):
+                    k2 = "model." + k2
+                    inner_model_keys_fixed += 1
+                fixed_state_dict[k2] = v
+            
+            if inner_model_keys_fixed > 0:
+                print(f"[get_default_mode_and_env] Fixed {inner_model_keys_fixed} inner_model.* keys to model.inner_model.*")
+            
+            print(f"[get_default_mode_and_env] Fixed state dict has {len(fixed_state_dict)} keys")
+            print(f"[get_default_mode_and_env] Loading weights into model...")
+            missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
+            print(f"[get_default_mode_and_env] Loaded pretrained weights: {len(fixed_state_dict)} keys")
+            if missing:
+                print(f"[get_default_mode_and_env] Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
+                if len(missing) > 50:
+                    print(f"[get_default_mode_and_env] WARNING: Too many missing keys ({len(missing)}). Model may not be properly loaded!")
+            if unexpected:
+                print(f"[get_default_mode_and_env] Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+            
+            # Verify critical components were loaded
+            model_state = model.state_dict()
+            critical_components = ["model.inner_model", "static_resnet", "gripper_resnet", "language_goal"]
+            for component in critical_components:
+                component_keys = [k for k in model_state.keys() if k.startswith(component)]
+                if len(component_keys) == 0:
+                    print(f"[get_default_mode_and_env] WARNING: No weights found for {component}!")
+                else:
+                    loaded_keys = [k for k in fixed_state_dict.keys() if k.startswith(component)]
+                    if len(loaded_keys) == 0:
+                        print(f"[get_default_mode_and_env] WARNING: {component} weights not found in checkpoint!")
+                        # Check if weights are actually initialized (not all zeros)
+                        sample_key = component_keys[0]
+                        sample_weight = model_state[sample_key]
+                        if torch.allclose(sample_weight, torch.zeros_like(sample_weight), atol=1e-6):
+                            print(f"[get_default_mode_and_env] CRITICAL: {component} weights appear to be uninitialized (all zeros)!")
+                        elif torch.allclose(sample_weight, sample_weight[0].expand_as(sample_weight), atol=1e-6):
+                            print(f"[get_default_mode_and_env] CRITICAL: {component} weights appear to be uninitialized (all same values)!")
+                    else:
+                        print(f"[get_default_mode_and_env] ✓ {component}: {len(loaded_keys)} keys loaded")
+                        # Verify that loaded weights are not all zeros
+                        sample_key = component_keys[0]
+                        if sample_key in fixed_state_dict:
+                            sample_weight = fixed_state_dict[sample_key]
+                            if torch.allclose(sample_weight, torch.zeros_like(sample_weight), atol=1e-6):
+                                print(f"[get_default_mode_and_env] WARNING: {component} loaded weights appear to be all zeros!")
+                            loaded_weight = model_state[sample_key]
+                            # Move both tensors to CPU for comparison (to avoid device mismatch)
+                            sample_weight_cpu = sample_weight.cpu() if sample_weight.device.type == 'cuda' else sample_weight
+                            loaded_weight_cpu = loaded_weight.cpu() if loaded_weight.device.type == 'cuda' else loaded_weight
+                            if not torch.allclose(loaded_weight_cpu, sample_weight_cpu, atol=1e-5):
+                                print(f"[get_default_mode_and_env] WARNING: {component} weights may not have been loaded correctly!")
+            
+            print(f"[get_default_mode_and_env] Successfully loaded weights from Hugging Face!")
+        except Exception as e:
+            print(f"[get_default_mode_and_env] ERROR: Failed to load pretrained weights from Hugging Face {repo_id}: {e}")
+            import traceback
+            print(f"[get_default_mode_and_env] Traceback:\n{traceback.format_exc()}")
+            raise
         
         model.freeze()
         model = move_model_to_device(model, device)
-        print("Successfully loaded model from Hugging Face.")
+        model.eval()  # Ensure model is in eval mode
+        print("[get_default_mode_and_env] Successfully loaded model from Hugging Face.")
+        
+        # Verify model configuration
+        print(f"[get_default_mode_and_env] Model use_text_not_embedding: {model.use_text_not_embedding}")
+        print(f"[get_default_mode_and_env] Model device: {next(model.parameters()).device}")
+        print(f"[get_default_mode_and_env] Model training mode: {model.training}")
+        
+        # Verify critical weights are not all zeros
+        with torch.no_grad():
+            inner_model_sample = model.model.inner_model.pos_emb
+            if torch.allclose(inner_model_sample, torch.zeros_like(inner_model_sample), atol=1e-6):
+                print("[get_default_mode_and_env] CRITICAL: model.inner_model.pos_emb appears to be all zeros!")
+            else:
+                print(f"[get_default_mode_and_env] model.inner_model.pos_emb is initialized (mean: {inner_model_sample.mean().item():.6f}, std: {inner_model_sample.std().item():.6f})")
         
         return model, env, data_module, lang_embeddings
     
@@ -340,15 +421,89 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
                 env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
 
 
-        # new stuff
-        # overwrite_cfg = cfg.overwrite_module_cfg if "overwrite_module_cfg" in cfg else {}
+        # Load model from local checkpoint
         module_path = (Path(train_folder).expanduser())
+        checkpoint_dir = module_path / checkpoint
+        
+        if not checkpoint_dir.is_dir():
+            raise ValueError(f"not valid file path: {str(checkpoint_dir)}")
+        
+        config = get_config_from_dir(checkpoint_dir)
+        
+        # Look for weight files in the directory
+        weight_file = None
+        potential_files = [
+            checkpoint_dir / "model_cleaned.safetensors",
+            checkpoint_dir / "model.safetensors",
+        ]
+        # Also check for .ckpt files
+        ckpt_files = list(checkpoint_dir.glob("*.ckpt"))
+        if ckpt_files:
+            potential_files.extend(ckpt_files)
+        
+        for p in potential_files:
+            if p.exists():
+                weight_file = p
+                break
+        
+        if weight_file is None:
+            raise FileNotFoundError(f"Could not find model weights in {checkpoint_dir}. Looked for: {potential_files}")
 
-        print(f"Loading model from {module_path / checkpoint}")
-        model = load_mode_from_safetensor(
-            module_path / checkpoint,
-            overwrite_cfg=eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {},
-        )
+        print(f"Loading model from {checkpoint_dir}")
+        
+        # Same approach as training_libero_msillm.py: instantiate model first, then load weights
+        overwrite_cfg = eval_cfg_overwrite.model if "model" in eval_cfg_overwrite else {}
+        load_cfg = OmegaConf.create({**OmegaConf.to_object(config.model), **{"optimizer": None}, **overwrite_cfg})
+        # Don't set ckpt_path - we'll load weights manually (same as training)
+        if "ckpt_path" in load_cfg:
+            del load_cfg["ckpt_path"]
+        model = hydra.utils.instantiate(load_cfg)
+        
+        # Load weights from file (same as training_libero_msillm.py line 718-719)
+        print(f"Loading weights from {weight_file}")
+        if weight_file.suffix == ".safetensors":
+            state_dict = load_file(weight_file)
+            # Handle potential key prefixes
+            # Note: Hugging Face checkpoints have 'model.' prefix removed during save (save_to_hf.py line 121)
+            # So 'inner_model.*' keys need to be mapped back to 'model.inner_model.*'
+            fixed_state_dict = {}
+            inner_model_keys_fixed = 0
+            for k, v in state_dict.items():
+                k2 = k
+                if k2.startswith("state_dict."):
+                    k2 = k2[len("state_dict."):]
+                if k2.startswith("model."):
+                    k2 = k2[len("model."):]
+                # Handle inner_model.* keys that need to be mapped to model.inner_model.*
+                # (because save_to_hf.py removes 'model.' prefix, so inner_model.* -> model.inner_model.*)
+                if k2.startswith("inner_model."):
+                    k2 = "model." + k2
+                    inner_model_keys_fixed += 1
+                fixed_state_dict[k2] = v
+            
+            if inner_model_keys_fixed > 0:
+                print(f"Fixed {inner_model_keys_fixed} inner_model.* keys to model.inner_model.*")
+            missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
+            print(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
+            if missing:
+                print(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
+                if len(missing) > 50:
+                    print(f"WARNING: Too many missing keys ({len(missing)}). Model may not be properly loaded!")
+            if unexpected:
+                print(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+        else:
+            # .ckpt file - same as training_libero_msillm.py: load state_dict directly
+            checkpoint = torch.load(weight_file.as_posix(), map_location='cpu', weights_only=False)
+            missing, unexpected = model.load_state_dict(checkpoint['state_dict'], strict=False)
+            print(f"Loaded weights from checkpoint: {len(checkpoint['state_dict'])} keys")
+            if missing:
+                print(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
+                if len(missing) > 50:
+                    print(f"WARNING: Too many missing keys ({len(missing)}). Model may not be properly loaded!")
+            if unexpected:
+                print(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+
+        print(f"Finished loading model from {checkpoint_dir}")
         model.freeze()
         model = move_model_to_device(model, device)
         print("Successfully loaded model.")
@@ -623,38 +778,6 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
     print("Successfully loaded model.")
 
     return model, env, data_module, lang_embeddings, cfg
-
-def load_mode_from_safetensor(
-    filedir: Path,
-    overwrite_cfg: dict = {},
-):
-    if not filedir.is_dir():
-        raise ValueError(f"not valid file path: {str(filedir)}")
-    
-    config = get_config_from_dir(filedir)
-    ckpt_path = filedir
-
-    print(f"Loading model from {ckpt_path}")
-    load_cfg = OmegaConf.create({**OmegaConf.to_object(config.model), **{"optimizer": None}, **overwrite_cfg})
-    load_cfg["ckpt_path"] = str(ckpt_path)
-    model = hydra.utils.instantiate(load_cfg)
-     # Load EMA weights if they exist and the flag is set
-    # if use_ema_weights:
-    #     checkpoint_data = torch.load(ckpt_path)
-    #     if "ema_weights" in checkpoint_data['callbacks']['EMA']:
-    #         ema_weights_list = checkpoint_data['callbacks']['EMA']['ema_weights']
-
-    #         # Convert list of tensors to a state_dict format
-    #         ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(model.named_parameters())}
-
-    #         model.load_state_dict(ema_weights_dict)
-    #         print("Successfully loaded EMA weights from checkpoint!")
-    #     else:
-    #         print("Warning: No EMA weights found in checkpoint!")
-
-    print(f"Finished loading model {ckpt_path}")
-    return model
-
 
 def join_vis_lang(img, lang_text):
     """Takes as input an image and a language instruction and visualizes them with cv2"""

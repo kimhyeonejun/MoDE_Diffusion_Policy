@@ -593,6 +593,9 @@ class MoDEAgent(pl.LightningModule):
             # latent_goal = self.language_goal(goal["lang_text"])
             latent_goal = self.lang_buffer.get_goal_instruction_embeddings(goal["lang_text"])
             latent_goal = latent_goal.to(torch.float32)
+            # Ensure latent_goal has shape (B, Dim) not (B, 1, Dim)
+            if len(latent_goal.shape) == 3 and latent_goal.shape[1] == 1:
+                latent_goal = latent_goal.squeeze(1)
         else:
             latent_goal = self.language_goal(goal["lang"]).unsqueeze(0).to(torch.float32).to(obs["rgb_obs"]['rgb_static'].device)
         if self.need_precompute_experts_for_inference:
@@ -754,8 +757,6 @@ class MoDEAgent(pl.LightningModule):
             latent_goal = latent_goal.unsqueeze(1) # .expand(-1, seq_len, -1)
         input_state = perceptual_emb
         sigmas = self.get_noise_schedule(sampling_steps, self.noise_scheduler)
-        if len(latent_goal.shape) == 2:
-            goal = einops.rearrange(goal, 'b d -> 1 b d')
 
         x = torch.randn((len(latent_goal), self.act_window_size, 7), device=self.device) * self.sigma_max
 
