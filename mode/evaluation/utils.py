@@ -201,9 +201,6 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
     is_hf_repo = "/" in checkpoint_str and not Path(checkpoint_str).exists() and not Path(checkpoint_str).is_absolute()
     
     print(f"[get_default_mode_and_env] checkpoint: {checkpoint_str}")
-    print(f"[get_default_mode_and_env] is_hf_repo: {is_hf_repo}")
-    print(f"[get_default_mode_and_env] Path.exists(): {Path(checkpoint_str).exists()}")
-    print(f"[get_default_mode_and_env] Path.is_absolute(): {Path(checkpoint_str).is_absolute()}")
     
     if is_hf_repo:
         # Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10")
@@ -327,40 +324,7 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
                 if len(missing) > 50:
                     print(f"[get_default_mode_and_env] WARNING: Too many missing keys ({len(missing)}). Model may not be properly loaded!")
             if unexpected:
-                print(f"[get_default_mode_and_env] Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
-            
-            # Verify critical components were loaded
-            model_state = model.state_dict()
-            critical_components = ["model.inner_model", "static_resnet", "gripper_resnet", "language_goal"]
-            for component in critical_components:
-                component_keys = [k for k in model_state.keys() if k.startswith(component)]
-                if len(component_keys) == 0:
-                    print(f"[get_default_mode_and_env] WARNING: No weights found for {component}!")
-                else:
-                    loaded_keys = [k for k in fixed_state_dict.keys() if k.startswith(component)]
-                    if len(loaded_keys) == 0:
-                        print(f"[get_default_mode_and_env] WARNING: {component} weights not found in checkpoint!")
-                        # Check if weights are actually initialized (not all zeros)
-                        sample_key = component_keys[0]
-                        sample_weight = model_state[sample_key]
-                        if torch.allclose(sample_weight, torch.zeros_like(sample_weight), atol=1e-6):
-                            print(f"[get_default_mode_and_env] CRITICAL: {component} weights appear to be uninitialized (all zeros)!")
-                        elif torch.allclose(sample_weight, sample_weight[0].expand_as(sample_weight), atol=1e-6):
-                            print(f"[get_default_mode_and_env] CRITICAL: {component} weights appear to be uninitialized (all same values)!")
-                    else:
-                        print(f"[get_default_mode_and_env] ✓ {component}: {len(loaded_keys)} keys loaded")
-                        # Verify that loaded weights are not all zeros
-                        sample_key = component_keys[0]
-                        if sample_key in fixed_state_dict:
-                            sample_weight = fixed_state_dict[sample_key]
-                            if torch.allclose(sample_weight, torch.zeros_like(sample_weight), atol=1e-6):
-                                print(f"[get_default_mode_and_env] WARNING: {component} loaded weights appear to be all zeros!")
-                            loaded_weight = model_state[sample_key]
-                            # Move both tensors to CPU for comparison (to avoid device mismatch)
-                            sample_weight_cpu = sample_weight.cpu() if sample_weight.device.type == 'cuda' else sample_weight
-                            loaded_weight_cpu = loaded_weight.cpu() if loaded_weight.device.type == 'cuda' else loaded_weight
-                            if not torch.allclose(loaded_weight_cpu, sample_weight_cpu, atol=1e-5):
-                                print(f"[get_default_mode_and_env] WARNING: {component} weights may not have been loaded correctly!")
+                print(f"[get_default_mode_and_env] Unexpected keys (ignored): {len(unexpected)} keys")
             
             print(f"[get_default_mode_and_env] Successfully loaded weights from Hugging Face!")
         except Exception as e:
@@ -373,19 +337,6 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
         model = move_model_to_device(model, device)
         model.eval()  # Ensure model is in eval mode
         print("[get_default_mode_and_env] Successfully loaded model from Hugging Face.")
-        
-        # Verify model configuration
-        print(f"[get_default_mode_and_env] Model use_text_not_embedding: {model.use_text_not_embedding}")
-        print(f"[get_default_mode_and_env] Model device: {next(model.parameters()).device}")
-        print(f"[get_default_mode_and_env] Model training mode: {model.training}")
-        
-        # Verify critical weights are not all zeros
-        with torch.no_grad():
-            inner_model_sample = model.model.inner_model.pos_emb
-            if torch.allclose(inner_model_sample, torch.zeros_like(inner_model_sample), atol=1e-6):
-                print("[get_default_mode_and_env] CRITICAL: model.inner_model.pos_emb appears to be all zeros!")
-            else:
-                print(f"[get_default_mode_and_env] model.inner_model.pos_emb is initialized (mean: {inner_model_sample.mean().item():.6f}, std: {inner_model_sample.std().item():.6f})")
         
         return model, env, data_module, lang_embeddings
     
@@ -486,22 +437,18 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
             missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
             print(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
             if missing:
-                print(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
-                if len(missing) > 50:
-                    print(f"WARNING: Too many missing keys ({len(missing)}). Model may not be properly loaded!")
+                print(f"Missing keys (not loaded): {len(missing)} keys")
             if unexpected:
-                print(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+                print(f"Unexpected keys (ignored): {len(unexpected)} keys")
         else:
             # .ckpt file - same as training_libero_msillm.py: load state_dict directly
             checkpoint = torch.load(weight_file.as_posix(), map_location='cpu', weights_only=False)
             missing, unexpected = model.load_state_dict(checkpoint['state_dict'], strict=False)
             print(f"Loaded weights from checkpoint: {len(checkpoint['state_dict'])} keys")
             if missing:
-                print(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
-                if len(missing) > 50:
-                    print(f"WARNING: Too many missing keys ({len(missing)}). Model may not be properly loaded!")
+                print(f"Missing keys (not loaded): {len(missing)} keys")
             if unexpected:
-                print(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+                print(f"Unexpected keys (ignored): {len(unexpected)} keys")
 
         print(f"Finished loading model from {checkpoint_dir}")
         model.freeze()
@@ -545,13 +492,24 @@ def patch_modeagent_embed_visual_obs_for_msillm(model):
     if msillm is None:
         return None
 
-    encoder = getattr(msillm, "encoder", None)
-    decoder = getattr(msillm, "decoder", None)
-    if encoder is None or decoder is None:
-        return None
+    # Check if compress and decompress methods exist
+    if not hasattr(msillm, "compress") or not hasattr(msillm, "decompress"):
+        # Fallback to encoder/decoder if compress/decompress don't exist
+        encoder = getattr(msillm, "encoder", None)
+        decoder = getattr(msillm, "decoder", None)
+        if encoder is None or decoder is None:
+            return None
+        use_compress_decompress = False
+    else:
+        use_compress_decompress = True
+        # If available, put model in compression mode (moves entropy bottlenecks to CPU)
+        if hasattr(msillm, "update_tensor_devices"):
+            try:
+                msillm.update_tensor_devices("compress")
+            except Exception as e:
+                print(f"[WARNING] Failed to update tensor devices for compression: {e}")
 
-    encoder.eval()
-    decoder.eval()
+    msillm.eval()
 
     orig = getattr(model, "embed_visual_obs", None)
     if orig is None or not callable(orig):
@@ -565,12 +523,18 @@ def patch_modeagent_embed_visual_obs_for_msillm(model):
         x01_bt = x01.reshape(b * t, c, h, w)
 
         with torch.no_grad():
-            z = encoder(x01_bt)
-            recon = decoder(z)
+            if use_compress_decompress:
+                # Use compress/decompress (same as official MS-ILLM evaluation code)
+                compressed = msillm.compress(x01_bt, force_cpu=False)
+                recon = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
+            else:
+                # Fallback to encoder/decoder
+                encoder = getattr(msillm, "encoder", None)
+                decoder = getattr(msillm, "decoder", None)
+                recon = decoder(encoder(x01_bt)).clamp(0.0, 1.0)
         
         if recon.shape != x01_bt.shape and recon.numel() == x01_bt.numel():
             recon = recon.view_as(x01_bt)
-        recon = recon.clamp(0.0, 1.0)
 
         recon = recon.reshape(b, t, c, h, w)
         out = (recon - mean) / std
@@ -582,7 +546,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model):
         return orig(rgb_static, rgb_gripper, latent_goal)
 
     model.embed_visual_obs = types.MethodType(_patched, model)
-    return decoder
+    return msillm
 
 def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
     # Resolve checkpoint path (handle both file and dir)
@@ -765,11 +729,6 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
             model.load_state_dict(sd, strict=False)
             print("Loaded regular weights (EMA weights not found or failed to load)")
     
-    # Verify MS-ILLM weights were loaded
-    if hasattr(model, "msillm_model") and model.msillm_model is not None:
-        msillm_state = model.msillm_model.state_dict()
-        print(f"MS-ILLM model has {len(msillm_state)} parameters")
-
     # 4. Patch MS-ILLM forward
     patch_modeagent_embed_visual_obs_for_msillm(model)
 

@@ -2,7 +2,15 @@
 Utilities for calculating Bits Per Pixel (BPP) for MS-ILLM compression.
 """
 import torch
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any, List, Union
+
+try:
+    from neuralcompression.metrics import pickle_size_of
+except ImportError:
+    # Fallback if neuralcompression is not available
+    import pickle
+    def pickle_size_of(obj):
+        return len(pickle.dumps(obj))
 
 
 def calculate_bpp_from_latent(
@@ -63,6 +71,42 @@ def calculate_bpp_from_encoder_output(
     )
 
 
+def calculate_bpp_from_hyperprior_output(
+    compressed_output: Any,
+    original_shape: Tuple[int, ...],
+) -> float:
+    """
+    Calculate BPP from HyperpriorCompressedOutput (actual bitstream).
+    Uses pickle_size_of (same as official MS-ILLM evaluation code).
+    
+    Args:
+        compressed_output: HyperpriorCompressedOutput object containing latent_strings and hyper_latent_strings
+        original_shape: Original image shape (C, H, W) or (B, C, H, W)
+        
+    Returns:
+        BPP value
+    """
+    # Get number of pixels in original image
+    if len(original_shape) == 3:
+        # (C, H, W)
+        num_pixels = original_shape[1] * original_shape[2]
+        batch_size = 1
+    elif len(original_shape) == 4:
+        # (B, C, H, W)
+        num_pixels = original_shape[2] * original_shape[3]
+        batch_size = original_shape[0]
+    else:
+        raise ValueError(f"Unexpected original_shape: {original_shape}")
+    
+    # Use pickle_size_of (same as official MS-ILLM evaluation code)
+    num_bytes = pickle_size_of(compressed_output)
+    total_bits = num_bytes * 8
+    
+    # BPP = total_bits / (num_pixels * batch_size)
+    bpp = total_bits / (num_pixels * batch_size)
+    return bpp
+
+
 def accumulate_bpp_stats(
     bpp_dict: Dict[str, float],
     stats_dict: Optional[Dict[str, list]] = None,
@@ -106,4 +150,3 @@ def compute_average_bpp(stats_dict: Dict[str, list]) -> Dict[str, float]:
             avg_bpp[key] = 0.0
     
     return avg_bpp
-
