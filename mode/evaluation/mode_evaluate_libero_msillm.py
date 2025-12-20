@@ -27,7 +27,7 @@ if libero_repo_dir.exists():
     current_pythonpath = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
 
-from mode.evaluation.utils import get_msillm_mode_and_env, patch_modeagent_embed_visual_obs_for_msillm
+from mode.evaluation.utils import get_msillm_mode_and_env
 from mode.evaluation.multistep_sequences import get_sequences
 from mode.utils.bpp_utils import (
     calculate_bpp_from_encoder_output,
@@ -42,6 +42,25 @@ from libero.lifelong.utils import get_task_embs
 
 
 log_print = logging.getLogger(__name__)
+
+
+class LatentCaptureWrapper:
+    """Simple wrapper to capture latents for BPP calculation."""
+    def __init__(self, original_method):
+        self.original = original_method
+        self.latents = []
+        self.call_count = 0
+    
+    def __call__(self, *args, **kwargs):
+        latent = self.original(*args, **kwargs)
+        self.latents.append(latent)
+        self.call_count += 1
+        return latent
+    
+    def clear(self):
+        """Clear captured latents."""
+        self.latents = []
+        self.call_count = 0
 
 def get_log_dir(log_dir, checkpoint_name=None):
     # Use checkpoint-based directory if checkpoint name is provided
@@ -207,15 +226,14 @@ class EvaluateLibero:
         return successes
 
     def evaluate_task(self, model, task_i, task_emb, task_str, idx, sim_states=None, store_video=0):
-        # Get compress method reference (already wrapped in main function)
+        # Get wrapped compression method for BPP measurement
         compress_method = None
-        try:
-            compress_method = model.msillm_model.compress
-        except AttributeError:
-            try:
-                compress_method = model.msillm_model.encoder.forward
-            except AttributeError:
-                pass
+        msillm_model = getattr(model, "msillm_model", None)
+        if msillm_model is not None:
+            if hasattr(msillm_model, "compress") and isinstance(msillm_model.compress, LatentCaptureWrapper):
+                compress_method = msillm_model.compress
+            elif hasattr(msillm_model, "encoder") and isinstance(msillm_model.encoder.forward, LatentCaptureWrapper):
+                compress_method = msillm_model.encoder.forward
         
         env_args = {
             "bddl_file_name": os.path.join(
@@ -280,42 +298,26 @@ class EvaluateLibero:
                 data, goal = self.process_env_obs(obs, task_emb, task_i.language)
                 
                 # Clear captured latents for this step
-                if compress_method is not None and hasattr(compress_method, 'latents'):
-                    compress_method.latents = []
-                    compress_method.call_count = 0
+                if compress_method is not None:
+                    compress_method.clear()
                 
                 actions = model.step(data, goal)
                 
-                # Calculate BPP from captured latents (compression happened in model.step)
-                if compress_method is not None and hasattr(compress_method, 'latents') and len(compress_method.latents) > 0:
+                # Calculate BPP from captured latents (only rgb_static is compressed)
+                if compress_method is not None and len(compress_method.latents) > 0:
                     bpp_dict = {}
-                    # compress_method.latents contains latents in order: [rgb_static_latent, rgb_gripper_latent]
-                    # Each latent corresponds to one image after reshape to (b*t, c, h, w)
-                    keys = ['rgb_static', 'rgb_gripper']
-                    for idx_latent, key in enumerate(keys):
-                        if idx_latent < len(compress_method.latents):
-                            latent = compress_method.latents[idx_latent]
-                            # Get original image shape from data
-                            if key in data.get('rgb_obs', {}):
-                                img = data['rgb_obs'][key]  # (1, C, H, W)
-                                # Remove batch dim for BPP calculation
-                                img_for_bpp = img.squeeze(0)  # (C, H, W)
-                                
-                                # Calculate BPP
-                                if hasattr(latent, 'latent_strings'):
-                                    # HyperpriorCompressedOutput (string-based compression)
-                                    bpp = calculate_bpp_from_hyperprior_output(
-                                        latent,
-                                        img_for_bpp.shape,
-                                    )
-                                else:
-                                    # Tensor (quantized latent)
-                                    bpp = calculate_bpp_from_encoder_output(
-                                        latent,
-                                        img_for_bpp,
-                                        bits_per_element=8,  # Assuming 8-bit quantization
-                                    )
-                                bpp_dict[key] = bpp
+                    # Only rgb_static is compressed, so first latent corresponds to rgb_static
+                    if 'rgb_static' in data.get('rgb_obs', {}):
+                        latent = compress_method.latents[0]
+                        img = data['rgb_obs']['rgb_static']  # (1, C, H, W)
+                        img_for_bpp = img.squeeze(0)  # (C, H, W)
+                        
+                        # Calculate BPP
+                        if hasattr(latent, 'latent_strings'):
+                            bpp = calculate_bpp_from_hyperprior_output(latent, img_for_bpp.shape)
+                        else:
+                            bpp = calculate_bpp_from_encoder_output(latent, img_for_bpp, bits_per_element=8)
+                        bpp_dict['rgb_static'] = bpp
                     
                     # Accumulate BPP statistics
                     if bpp_dict:
@@ -471,60 +473,14 @@ def main(cfg: DictConfig):
         prep_dm_and_deps=False
     )
     
-    # Wrap MS-ILLM compress method for BPP measurement
-    # Note: get_msillm_mode_and_env already patches embed_visual_obs, so we need to:
-    # 1. Wrap compress method first
-    # 2. Re-patch embed_visual_obs so it uses the wrapped compress method
+    # Wrap MS-ILLM compression method for BPP measurement
+    # This captures latents during forward pass for BPP calculation
     msillm_model = getattr(model, "msillm_model", None)
     if msillm_model is not None:
-        # Check if compress method exists (preferred) or fallback to encoder
         if hasattr(msillm_model, "compress"):
-            # Store original compress method
-            original_compress = msillm_model.compress
-            
-            # Wrap compress to capture latents when called
-            def _capture_compress(*args, **kwargs):
-                latent = original_compress(*args, **kwargs)
-                # Store latent for BPP calculation
-                if not hasattr(_capture_compress, 'call_count'):
-                    _capture_compress.call_count = 0
-                    _capture_compress.latents = []
-                
-                _capture_compress.call_count += 1
-                _capture_compress.latents.append(latent)
-                return latent
-            
-            msillm_model.compress = _capture_compress
-            print("[INFO] Wrapped MS-ILLM compress method for BPP measurement")
-            
-            # Re-patch embed_visual_obs so it uses the wrapped compress method
-            patch_modeagent_embed_visual_obs_for_msillm(model)
-            print("[INFO] Re-patched embed_visual_obs to use wrapped compress method")
-        else:
-            # Fallback to encoder wrapping if compress method doesn't exist
-            encoder = getattr(msillm_model, "encoder", None)
-            if encoder is not None:
-                # Store original forward method
-                original_encoder_forward = encoder.forward
-                
-                # Wrap encoder to capture latents when called
-                def _capture_encoder_forward(*args, **kwargs):
-                    latent = original_encoder_forward(*args, **kwargs)
-                    # Store latent for BPP calculation
-                    if not hasattr(_capture_encoder_forward, 'call_count'):
-                        _capture_encoder_forward.call_count = 0
-                        _capture_encoder_forward.latents = []
-                    
-                    _capture_encoder_forward.call_count += 1
-                    _capture_encoder_forward.latents.append(latent)
-                    return latent
-                
-                encoder.forward = _capture_encoder_forward
-                print("[INFO] Wrapped MS-ILLM encoder (fallback) for BPP measurement")
-                
-                # Re-patch embed_visual_obs so it uses the wrapped encoder
-                patch_modeagent_embed_visual_obs_for_msillm(model)
-                print("[INFO] Re-patched embed_visual_obs to use wrapped encoder")
+            msillm_model.compress = LatentCaptureWrapper(msillm_model.compress)
+        elif hasattr(msillm_model, "encoder"):
+            msillm_model.encoder.forward = LatentCaptureWrapper(msillm_model.encoder.forward)
     
     # Ensure DataModule is setup to load statistics
     if not hasattr(dm, 'train_datasets') or not dm.train_datasets:
