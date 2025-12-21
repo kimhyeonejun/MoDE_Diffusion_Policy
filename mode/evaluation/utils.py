@@ -470,7 +470,7 @@ def load_msillm_from_torchhub(cfg: DictConfig):
         return None, None
 
     ms_cfg = cfg.msillm
-    hub_repo = ms_cfg.get("hub_repo", "facebookresearch/NeuralCompression:v0.3.1")
+    hub_repo = ms_cfg.get("hub_repo", "facebookresearch/NeuralCompression:main")
     entrypoint = ms_cfg.get("entrypoint", "msillm_quality_1")
     pretrained = bool(ms_cfg.get("pretrained", True))
 
@@ -525,217 +525,185 @@ def patch_modeagent_embed_visual_obs_for_msillm(model):
         with torch.no_grad():
             if use_compress_decompress:
                 # Use compress/decompress (same as official MS-ILLM evaluation code)
-                compressed = msillm.compress(x01_bt, force_cpu=False)
-                recon = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
+                # Check if compress method has been wrapped (for BPP measurement)
+                # This allows wrapper to capture latents even when called from patched function
+                compress_method = getattr(msillm, "compress", None)
+                if compress_method is not None:
+                    compressed = compress_method(x01_bt, force_cpu=False)
+                    recon = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
+                else:
+                    # Fallback if compress doesn't exist
+                    recon = x01_bt
             else:
-                # Fallback to encoder/decoder
-                encoder = getattr(msillm, "encoder", None)
-                decoder = getattr(msillm, "decoder", None)
-                recon = decoder(encoder(x01_bt)).clamp(0.0, 1.0)
+                recon = x01_bt
         
         if recon.shape != x01_bt.shape and recon.numel() == x01_bt.numel():
             recon = recon.view_as(x01_bt)
 
         recon = recon.reshape(b, t, c, h, w)
+        
+        # Store reconstructed image in [0, 1] range for video (recon is already in [0, 1])
+        if hasattr(model, '_store_reconstructed_frame') and hasattr(model, 'msillm_model') and model.msillm_model is not None:
+            # Take last timestep and first batch, convert to numpy [H, W, C] in [0, 255] range
+            recon_frame = recon[0, -1] if recon.dim() == 5 else recon[0]  # [C, H, W]
+            rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))  # Rotate 180 degrees
+            model._last_reconstructed_frame = rgb_recon_np[..., ::-1]  # RGB to BGR for cv2
+        
         out = (recon - mean) / std
         return out
 
     def _patched(self, rgb_static, rgb_gripper, latent_goal):
-        rgb_static = _reconstruct_normed(rgb_static)
-        rgb_gripper = _reconstruct_normed(rgb_gripper)
-        return orig(rgb_static, rgb_gripper, latent_goal)
+        rgb_static_recon = _reconstruct_normed(rgb_static)
+        #rgb_gripper = _reconstruct_normed(rgb_gripper)
+        return orig(rgb_static_recon, rgb_gripper, latent_goal)
 
     model.embed_visual_obs = types.MethodType(_patched, model)
     return msillm
 
 def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
-    # Resolve checkpoint path (handle both file and dir)
-    train_folder_path = Path(train_folder).expanduser()
-    ckpt_path = train_folder_path / checkpoint
+    checkpoint_str = str(checkpoint)
+    is_hf_repo = "/" in checkpoint_str and not Path(checkpoint_str).exists() and not Path(checkpoint_str).is_absolute()
+    print(f"[get_msillm_mode_and_env] checkpoint: {checkpoint_str}")
     
-    # Locate config
-    train_cfg_path = None
-    if ckpt_path.is_file():
-        # Check standard locations relative to file
-        if (ckpt_path.parent / ".hydra/config.yaml").exists():
-            train_cfg_path = ckpt_path.parent / ".hydra/config.yaml"
-        elif (train_folder_path / ".hydra/config.yaml").exists():
-            train_cfg_path = train_folder_path / ".hydra/config.yaml"
-    
-    if train_cfg_path is None:
-        # Fallback to assumption that checkpoint is a directory (or config is inside it)
-        train_cfg_path = ckpt_path / ".hydra/config.yaml"
-
-    train_cfg_path = format_sftp_path(train_cfg_path)
-    print(f"Loading config from {train_cfg_path}")
-
-    # For evaluation, use the main config instead of training config
+    # Load config
     if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
         hydra.initialize("../../conf")
-
+    
     try:
         def_cfg = hydra.compose(config_name="config_libero_msillm")
     except:
-        # Fallback to loading training config
-        def_cfg = OmegaConf.load(train_cfg_path)
+        train_cfg_path = Path(train_folder).expanduser() / ".hydra/config.yaml"
+        if train_cfg_path.exists():
+            def_cfg = OmegaConf.load(train_cfg_path)
+        else:
+            raise FileNotFoundError(f"Could not find config. Tried config_libero_msillm.yaml and {train_cfg_path}")
 
-    eval_override_cfg = OmegaConf.create(eval_cfg_overwrite)
-    cfg = OmegaConf.merge(def_cfg, eval_override_cfg)
+    cfg = OmegaConf.merge(def_cfg, OmegaConf.create(eval_cfg_overwrite))
     
-    # Safely get lang_folder with fallback
+def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
+    checkpoint_str = str(checkpoint)
+    is_hf_repo = "/" in checkpoint_str and not Path(checkpoint_str).exists() and not Path(checkpoint_str).is_absolute()
+    print(f"[get_msillm_mode_and_env] checkpoint: {checkpoint_str}")
+    
+    # Load config
+    if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+        hydra.initialize("../../conf")
+    
+    try:
+        def_cfg = hydra.compose(config_name="config_libero_msillm")
+    except:
+        train_cfg_path = Path(train_folder).expanduser() / ".hydra/config.yaml"
+        if train_cfg_path.exists():
+            def_cfg = OmegaConf.load(train_cfg_path)
+        else:
+            raise FileNotFoundError(f"Could not find config. Tried config_libero_msillm.yaml and {train_cfg_path}")
+
+    cfg = OmegaConf.merge(def_cfg, OmegaConf.create(eval_cfg_overwrite))
+    
+    # Get lang_folder with fallback
     try:
         lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
     except (AttributeError, KeyError):
-        # Fallback to default if not in config
         lang_folder = "lang_annotations"
-        # Temporarily disable struct mode to set the value
-        was_struct = OmegaConf.is_struct(cfg.datamodule.datasets.lang_dataset) if hasattr(cfg.datamodule.datasets, 'lang_dataset') else False
-        if was_struct:
-            OmegaConf.set_struct(cfg.datamodule.datasets.lang_dataset, False)
-        # Set it in config for consistency
-        if not hasattr(cfg.datamodule.datasets, 'lang_dataset') or cfg.datamodule.datasets.lang_dataset is None:
-            cfg.datamodule.datasets.lang_dataset = OmegaConf.create({"lang_folder": lang_folder})
-        else:
-            cfg.datamodule.datasets.lang_dataset.lang_folder = lang_folder
-        if was_struct:
-            OmegaConf.set_struct(cfg.datamodule.datasets.lang_dataset, True)
+    
+    # Setup data module
     if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
         hydra.initialize("../../conf/datamodule/datasets")
-    # we don't want to use shm dataset for evaluation
-    # GlobalHydra.instance().clear()
-    # datasets_cfg = hydra.initialize("datamodule/datasets/vision_lang.yaml")
-    # since we don't use the trainer during inference, manually set up data_module
-    # cfg.datamodule.datasets = datasets_cfg
+    
     device = get_device(device_id)
     cfg.datamodule.root_data_dir = dataset_path
     data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
+    
     if prep_dm_and_deps:
         data_module.prepare_data()
         data_module.setup()
         dataloader = data_module.val_dataloader()
         dataset = dataloader["lang"].dataset
-
+        
         if lang_embeddings is None:
             lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
-
+        
         if env is None:
             rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
             env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
 
-
-    # MS-ILLM Loading Logic
-    module_path = (Path(train_folder).expanduser())
-    ckpt_path = module_path / checkpoint
-    print(f"Loading model from {ckpt_path}")
-
-    # 1. Instantiate model (config without ckpt_path)
-    model_cfg = cfg.model
-    # Remove ckpt_path if present to prevent premature loading
-    model_cfg_dict = OmegaConf.to_container(model_cfg, resolve=True)
-    if "ckpt_path" in model_cfg_dict:
-        del model_cfg_dict["ckpt_path"]
-    model_cfg = OmegaConf.create(model_cfg_dict)
+    # Get weight file
+    if is_hf_repo:
+        print(f"[get_msillm_mode_and_env] Downloading from Hugging Face: {checkpoint_str}")
+        weight_file = Path(hf_hub_download(repo_id=checkpoint_str, filename="model_cleaned.safetensors"))
+    else:
+        ckpt_path = Path(train_folder).expanduser() / checkpoint
+        print(f"Loading model from {ckpt_path}")
         
-    model = hydra.utils.instantiate(model_cfg)
-
-    # 2. Determine the weight file first (to check if MS-ILLM weights are in checkpoint)
-    weight_file = None
-    if ckpt_path.is_file():
-        weight_file = ckpt_path
-    elif ckpt_path.is_dir():
-        # Look for typical weight files
-        potential_files = [
+        # Find weight file
+        potential_files = [ckpt_path] if ckpt_path.is_file() else [
             ckpt_path / "model.safetensors",
             ckpt_path / "model_cleaned.safetensors",
+            *ckpt_path.glob("*.ckpt")
         ]
-        # Also check for .ckpt if no safetensors
-        potential_files.extend(list(ckpt_path.glob("*.ckpt")))
-        
-        for p in potential_files:
-            if p.exists():
-                weight_file = p
-                break
-    
-    if weight_file is None or not weight_file.exists():
-        # Fallback for when ckpt_path itself doesn't exist yet but might be a future path? 
-        # But we are loading.
-        raise FileNotFoundError(f"Could not find model weights in {ckpt_path}")
-    
-    # Check if checkpoint contains MS-ILLM weights
-    checkpoint_has_msillm = False
-    if weight_file.suffix == ".safetensors":
-        try:
-            state_dict = load_file(weight_file)
-            msillm_keys = [k for k in state_dict.keys() if k.startswith("msillm_model")]
-            checkpoint_has_msillm = len(msillm_keys) > 0
-            if checkpoint_has_msillm:
-                print(f"Found {len(msillm_keys)} MS-ILLM weights in checkpoint")
-        except:
-            pass
-    else:
-        try:
-            sd = torch.load(weight_file, map_location='cpu')
-            state_dict_to_check = sd.get("state_dict", sd)
-            msillm_keys = [k for k in state_dict_to_check.keys() if k.startswith("msillm_model")]
-            checkpoint_has_msillm = len(msillm_keys) > 0
-            if checkpoint_has_msillm:
-                print(f"Found {len(msillm_keys)} MS-ILLM weights in checkpoint")
-        except:
-            pass
-    
-    # 3. Setup MS-ILLM (only if checkpoint doesn't have MS-ILLM weights)
-    if not checkpoint_has_msillm:
-        msillm_model, _ = load_msillm_from_torchhub(cfg)
-        if msillm_model is not None:
-            setattr(model, "msillm_model", msillm_model)
-            print("Attached MS-ILLM model from torch hub (pretrained weights)")
-    else:
-        print("MS-ILLM weights will be loaded from checkpoint")
+        weight_file = next((p for p in potential_files if p.exists()), None)
+        if weight_file is None:
+            raise FileNotFoundError(f"Could not find model weights in {ckpt_path}")
 
-    # 4. Load Weights
+    # Instantiate model
+    model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
+    model_cfg.pop("ckpt_path", None)
+    model = hydra.utils.instantiate(OmegaConf.create(model_cfg))
+    
+    # Always load MS-ILLM model structure (needed for compress/decompress methods)
+    # Weights will be loaded from checkpoint if available
+    msillm_model, _ = load_msillm_from_torchhub(cfg)
+    if msillm_model is not None:
+        setattr(model, "msillm_model", msillm_model)
+        print("Attached MS-ILLM model from torch hub (model structure)")
+    
+    # Load weights
     print(f"Loading weights from {weight_file}")
     if weight_file.suffix == ".safetensors":
         state_dict = load_file(weight_file)
+        # Fix key mapping for Hugging Face checkpoints
+        if is_hf_repo:
+            fixed_state_dict = {}
+            for k, v in state_dict.items():
+                k2 = k.replace("state_dict.", "").replace("model.", "", 1)
+                if k2.startswith("inner_model."):
+                    k2 = "model." + k2
+                fixed_state_dict[k2] = v
+            state_dict = fixed_state_dict
         model.load_state_dict(state_dict, strict=False)
     else:
-        sd = torch.load(weight_file, map_location='cpu')
-        
-        # Try to load EMA weights if available (preferred for evaluation)
-        ema_loaded = False
-        if "callbacks" in sd and "EMA" in sd["callbacks"]:
-            ema_callback_state = sd["callbacks"]["EMA"]
-            if "ema_weights" in ema_callback_state:
-                ema_weights_list = ema_callback_state["ema_weights"]
-                # Convert list of tensors to state_dict format
-                model_state_dict = model.state_dict()
-                ema_weights_dict = {}
-                param_idx = 0
-                for name, _ in model_state_dict.items():
-                    if param_idx < len(ema_weights_list):
-                        ema_weights_dict[name] = ema_weights_list[param_idx]
-                        param_idx += 1
-                    else:
-                        break
-                
-                if len(ema_weights_dict) > 0:
-                    model.load_state_dict(ema_weights_dict, strict=False)
-                    ema_loaded = True
-                    print("Successfully loaded EMA weights from checkpoint!")
-        
-        # Fallback to regular state_dict if EMA weights not available
-        if not ema_loaded:
-            if "state_dict" in sd:
-                sd = sd["state_dict"]
-            model.load_state_dict(sd, strict=False)
-            print("Loaded regular weights (EMA weights not found or failed to load)")
+        sd = torch.load(weight_file, map_location='cpu', weights_only=False)
+        # Try EMA weights first
+        if "callbacks" in sd and "EMA" in sd["callbacks"] and "ema_weights" in sd["callbacks"]["EMA"]:
+            ema_weights_list = sd["callbacks"]["EMA"]["ema_weights"]
+            model_state_dict = model.state_dict()
+            ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(model_state_dict.items()) if i < len(ema_weights_list)}
+            if ema_weights_dict:
+                model.load_state_dict(ema_weights_dict, strict=False)
+                print("Successfully loaded EMA weights from checkpoint!")
+            else:
+                model.load_state_dict(sd.get("state_dict", sd), strict=False)
+                print("Loaded regular weights (EMA weights not found)")
+        else:
+            model.load_state_dict(sd.get("state_dict", sd), strict=False)
+            print("Loaded regular weights")
     
-    # 4. Patch MS-ILLM forward
+    # Patch MS-ILLM and move to device
     patch_modeagent_embed_visual_obs_for_msillm(model)
-
     model.freeze()
     model = move_model_to_device(model, device)
+    
+    # Re-set compression mode after device move
+    msillm_model = getattr(model, "msillm_model", None)
+    if msillm_model is not None and hasattr(msillm_model, "update_tensor_devices"):
+        try:
+            msillm_model.update_tensor_devices("compress")
+            print("Re-set MS-ILLM to compression mode after device move (partial-GPU)")
+        except Exception as e:
+            print(f"[WARNING] Failed to update tensor devices for compression after device move: {e}")
+    
     print("Successfully loaded model.")
-
     return model, env, data_module, lang_embeddings, cfg
 
 def join_vis_lang(img, lang_text):

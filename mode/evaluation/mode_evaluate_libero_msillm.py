@@ -193,7 +193,7 @@ class EvaluateLibero:
                 wandb.log({f"eval_lh/sr_{task_name}": success})
         
         # Log BPP statistics if available
-        if self.bpp_stats:
+        if self.bpp_stats and len(self.bpp_stats) > 0:
             avg_bpp = compute_average_bpp(self.bpp_stats)
             print(f"\n{'='*60}")
             print(f"BPP Statistics:")
@@ -212,6 +212,10 @@ class EvaluateLibero:
 
     def evaluate_policy(self, model, store_video=False):
         successes = []
+        
+        print(f"\n{'='*60}")
+        print(f"Starting evaluation of {len(self.all_tasks)} tasks")
+        print(f"{'='*60}\n")
 
         for idx in self.all_tasks:  # Distribute tasks across GPUs
             task_name = self.task_names[idx]
@@ -220,20 +224,41 @@ class EvaluateLibero:
             
             task_str = f"k{self.all_tasks[-1]}_p{idx}"
             log_print.info(f"starting to evaluate: {task_name}")
+            print(f"\n[{idx+1}/{len(self.all_tasks)}] Evaluating: {task_name}")
+            print(f"Task description: {task_i.language}")
             success_rate = self.evaluate_task(model, task_i, task_emb, task_str, idx, store_video=store_video)
             successes.append(success_rate)
+            
+            # Print immediate result for this task
+            print(f"\n✓ Task {idx+1}/{len(self.all_tasks)} completed: {task_name}")
+            print(f"  Success rate: {success_rate:.2%} ({success_rate*self.n_eval:.0f}/{self.n_eval})")
+            
+            # Print running average
+            if len(successes) > 0:
+                avg_success = sum(successes) / len(successes)
+                print(f"  Running average: {avg_success:.2%} across {len(successes)} tasks")
+            print()
 
         return successes
 
     def evaluate_task(self, model, task_i, task_emb, task_str, idx, sim_states=None, store_video=0):
         # Get wrapped compression method for BPP measurement
-        compress_method = None
-        msillm_model = getattr(model, "msillm_model", None)
-        if msillm_model is not None:
-            if hasattr(msillm_model, "compress") and isinstance(msillm_model.compress, LatentCaptureWrapper):
-                compress_method = msillm_model.compress
-            elif hasattr(msillm_model, "encoder") and isinstance(msillm_model.encoder.forward, LatentCaptureWrapper):
-                compress_method = msillm_model.encoder.forward
+        # First try to get from model._bpp_wrapper (set in main)
+        compress_method = getattr(model, "_bpp_wrapper", None)
+        
+        # Fallback: try to find wrapper from msillm_model directly
+        if compress_method is None:
+            msillm_model = getattr(model, "msillm_model", None)
+            if msillm_model is not None:
+                if hasattr(msillm_model, "compress") and isinstance(msillm_model.compress, LatentCaptureWrapper):
+                    compress_method = msillm_model.compress
+                elif hasattr(msillm_model, "encoder") and hasattr(msillm_model.encoder, "forward") and isinstance(msillm_model.encoder.forward, LatentCaptureWrapper):
+                    compress_method = msillm_model.encoder.forward
+        
+        if compress_method is None:
+            log_print.warning(f"[BPP] No compress_method wrapper found for task {task_str} - BPP will not be measured")
+        else:
+            log_print.info(f"[BPP] Found compress_method wrapper for task {task_str}")
         
         env_args = {
             "bddl_file_name": os.path.join(
@@ -263,7 +288,8 @@ class EvaluateLibero:
         )
         init_states = torch.load(init_states_path, weights_only=False)
         num_success = 0
-        for i in tqdm(range(self.n_eval), desc="Evaluating"):
+        pbar = tqdm(range(self.n_eval), desc=f"Evaluating {task_i.language[:30]}")
+        for i in pbar:
             store_video_this_rollout = i < store_video
             if store_video_this_rollout:
                 video_frames = []
@@ -306,18 +332,22 @@ class EvaluateLibero:
                 # Calculate BPP from captured latents (only rgb_static is compressed)
                 if compress_method is not None and len(compress_method.latents) > 0:
                     bpp_dict = {}
-                    # Only rgb_static is compressed, so first latent corresponds to rgb_static
+                    # Only rgb_static is compressed, so last captured latent corresponds to rgb_static
+                    # (since we clear before each step, the only latent should be from this step)
                     if 'rgb_static' in data.get('rgb_obs', {}):
-                        latent = compress_method.latents[0]
+                        latent = compress_method.latents[-1]  # Get most recent latent
                         img = data['rgb_obs']['rgb_static']  # (1, C, H, W)
                         img_for_bpp = img.squeeze(0)  # (C, H, W)
                         
                         # Calculate BPP
-                        if hasattr(latent, 'latent_strings'):
-                            bpp = calculate_bpp_from_hyperprior_output(latent, img_for_bpp.shape)
-                        else:
-                            bpp = calculate_bpp_from_encoder_output(latent, img_for_bpp, bits_per_element=8)
-                        bpp_dict['rgb_static'] = bpp
+                        try:
+                            if hasattr(latent, 'latent_strings'):
+                                bpp = calculate_bpp_from_hyperprior_output(latent, img_for_bpp.shape)
+                            else:
+                                bpp = calculate_bpp_from_encoder_output(latent, img_for_bpp, bits_per_element=8)
+                            bpp_dict['rgb_static'] = bpp
+                        except Exception as e:
+                            log_print.warning(f"Failed to calculate BPP: {e}")
                     
                     # Accumulate BPP statistics
                     if bpp_dict:
@@ -327,11 +357,17 @@ class EvaluateLibero:
                 obs, reward, done, info = env.step(actions)
 
                 if store_video_this_rollout:
-                    frame = obs['agentview_image']
-                    # Fix: Rotate 180 degrees and convert RGB to BGR for cv2
-                    if isinstance(frame, np.ndarray):
-                        frame = np.rot90(frame, k=2, axes=(0, 1))
-                        frame = frame[..., ::-1]
+                    # Use reconstructed image if available (MS-ILLM restored), otherwise use original
+                    if hasattr(model, '_store_reconstructed_frame') and hasattr(model, '_last_reconstructed_frame'):
+                        # Use MS-ILLM reconstructed frame
+                        frame = model._last_reconstructed_frame
+                    else:
+                        # Fallback to original frame
+                        frame = obs['agentview_image']
+                        # Fix: Rotate 180 degrees and convert RGB to BGR for cv2
+                        if isinstance(frame, np.ndarray):
+                            frame = np.rot90(frame, k=2, axes=(0, 1))
+                            frame = frame[..., ::-1]
                     video_frames.append(frame)
 
                 if done:
@@ -344,8 +380,21 @@ class EvaluateLibero:
 
             # a new form of success record
             num_success += int(done)
+            
+            # Update progress bar with current success rate
+            current_success_rate = num_success / (i + 1)
+            pbar.set_postfix({
+                'success': num_success,
+                'total': i + 1,
+                'rate': f'{current_success_rate:.1%}',
+                'status': '✓' if done else '✗'
+            })
+            
+            # Log each rollout result
+            log_print.info(f"Rollout {i+1}/{self.n_eval}: {'SUCCESS' if done else 'FAILED'} (current rate: {current_success_rate:.2%}, {num_success}/{i+1})")
 
         success_rate = num_success / self.n_eval
+        pbar.close()
         
         env.close()
         gc.collect()
@@ -432,8 +481,25 @@ def main(cfg: DictConfig):
         print(f"Using checkpoint from environment variable: {checkpoint_env}")
         cfg.checkpoint = checkpoint_env
     
+    # If checkpoint is not specified (null/empty), use pretrain_chk from config_libero_msillm.yaml (Hugging Face repo)
+    if not cfg.checkpoint or cfg.checkpoint in ("", "null", None):
+        # Load config_libero_msillm to get pretrain_chk
+        try:
+            if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+                hydra.initialize("../../conf")
+            base_cfg = hydra.compose(config_name="config_libero_msillm")
+            if hasattr(base_cfg, "pretrain_chk") and base_cfg.pretrain_chk:
+                cfg.checkpoint = base_cfg.pretrain_chk
+                print(f"No checkpoint specified, using pretrained checkpoint from config_libero_msillm.yaml: {cfg.checkpoint}")
+            else:
+                raise ValueError("No checkpoint specified and pretrain_chk not found in config_libero_msillm.yaml")
+        except Exception as e:
+            print(f"Error: Could not load pretrain_chk from config: {e}")
+            raise ValueError("No checkpoint specified. Please provide checkpoint path or ensure pretrain_chk is set in config_libero_msillm.yaml")
+    
     # Sanitize checkpoint filename: replace '=' with '-' to avoid Hydra parsing issues
-    if "=" in cfg.checkpoint and not Path(cfg.checkpoint).is_absolute():
+    # (Only if checkpoint is not a Hugging Face repo ID)
+    if cfg.checkpoint and "=" in cfg.checkpoint and not Path(cfg.checkpoint).is_absolute() and "/" not in cfg.checkpoint:
         sanitized_checkpoint = cfg.checkpoint.replace("=", "-")
         checkpoint_path = Path(cfg.train_folder) / cfg.checkpoint
         sanitized_path = Path(cfg.train_folder) / sanitized_checkpoint
@@ -475,12 +541,32 @@ def main(cfg: DictConfig):
     
     # Wrap MS-ILLM compression method for BPP measurement
     # This captures latents during forward pass for BPP calculation
+    # NOTE: We wrap AFTER get_msillm_mode_and_env because patch happens inside it
+    # But wrapper will still work because utils.py uses getattr(msillm, "compress") for dynamic lookup
     msillm_model = getattr(model, "msillm_model", None)
+    wrapper = None
     if msillm_model is not None:
         if hasattr(msillm_model, "compress"):
-            msillm_model.compress = LatentCaptureWrapper(msillm_model.compress)
-        elif hasattr(msillm_model, "encoder"):
-            msillm_model.encoder.forward = LatentCaptureWrapper(msillm_model.encoder.forward)
+            # Store original compress method
+            original_compress = msillm_model.compress
+            # Wrap it
+            wrapper = LatentCaptureWrapper(original_compress)
+            msillm_model.compress = wrapper
+            print(f"[BPP] Wrapped msillm_model.compress for BPP measurement")
+        elif hasattr(msillm_model.encoder, "forward"):
+            # Store original encoder forward method
+            original_encoder_forward = msillm_model.encoder.forward
+            # Wrap it
+            wrapper = LatentCaptureWrapper(original_encoder_forward)
+            msillm_model.encoder.forward = wrapper
+            print(f"[BPP] Wrapped msillm_model.encoder.forward for BPP measurement")
+    
+    # Store wrapper on model object for easy access in evaluate_task
+    if wrapper is not None:
+        model._bpp_wrapper = wrapper
+        print(f"[BPP] Stored wrapper on model._bpp_wrapper")
+    else:
+        print(f"[BPP] WARNING: No wrapper created - BPP measurement may not work")
     
     # Ensure DataModule is setup to load statistics
     if not hasattr(dm, 'train_datasets') or not dm.train_datasets:

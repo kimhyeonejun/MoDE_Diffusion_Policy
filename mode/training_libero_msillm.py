@@ -113,7 +113,6 @@ def _patch_optimizer_to_only_train_selected(
         # Lightning allows returning optimizer or dict with optimizer/scheduler.
         optimizer = out["optimizer"] if isinstance(out, dict) and "optimizer" in out else out
         # Filter out any frozen params from existing param groups.
-        try:
             if hasattr(optimizer, "param_groups"):
                 new_groups = []
                 for g in optimizer.param_groups:
@@ -122,8 +121,6 @@ def _patch_optimizer_to_only_train_selected(
                         g["params"] = params
                         new_groups.append(g)
                 optimizer.param_groups = new_groups
-        except Exception:
-            pass
         if hasattr(optimizer, "add_param_group"):
             params = [p for p in extra_trainable_module.parameters() if p.requires_grad]
             if params:
@@ -160,17 +157,16 @@ def _freeze_compression_encoder_only_train_decoder(compression_model: torch.nn.M
 
 class ImageCompressionTransform:
     """
-    Lightweight transform that routes images through a frozen encoder/decoder pair.
+    Lightweight transform that routes images through MS-ILLM compression model.
+    For training, uses forward method to get output.image (same as training loop).
     Intended to mirror Phase 1 (image compression) so Phase 2 sees reconstructed images.
     """
     def __init__(
         self,
-        encoder: torch.nn.Module,
-        decoder: Optional[torch.nn.Module] = None,
+        compression_model: torch.nn.Module,
         device: str = "cpu",
     ):
-        self.encoder = encoder.eval()
-        self.decoder = decoder.eval() if decoder is not None else None
+        self.compression_model = compression_model.eval()
         self.device = torch.device(device)
 
     @torch.no_grad()
@@ -178,6 +174,7 @@ class ImageCompressionTransform:
         """
         Expects x in shape (T, C, H, W) or (C, H, W).
         Returns a reconstructed tensor on CPU for downstream transforms.
+        Uses forward method to get output.image (same as training).
         """
         original_shape = x.shape
         is_uint8 = x.dtype == torch.uint8
@@ -188,15 +185,35 @@ class ImageCompressionTransform:
         if x.dim() == 3:
             x = x.unsqueeze(0)
 
-        z = self.encoder(x)
-        recon = self.decoder(z) if self.decoder is not None else z
+        batch_size = x.shape[0]
+        x_flat = x.reshape(-1, *x.shape[-3:])  # Flatten to (B*T, C, H, W) if needed
 
-        # Best-effort reshape in case encoder/decoder flattens the batch dimension
+        # Use forward method to get output.image (same as training loop)
+        output = self.compression_model(x_flat)
+        if hasattr(output, 'image'):
+            recon = output.image.clamp(0.0, 1.0)
+        elif hasattr(output, 'x_hat'):
+            recon = output.x_hat.clamp(0.0, 1.0)
+        else:
+            # If output is just a tensor
+            recon = output.clamp(0.0, 1.0) if isinstance(output, torch.Tensor) else x_flat
+
+        # Reshape back to original batch structure
+        if recon.shape[0] != batch_size:
+            recon = recon.reshape(batch_size, *recon.shape[1:])
+
+        # Best-effort reshape in case dimensions don't match
         if recon.shape != x.shape and recon.numel() == x.numel():
             recon = recon.view_as(x)
 
         if original_shape == recon.shape[1:]:
             recon = recon.squeeze(0)
+        elif original_shape == recon.shape:
+            pass  # Already correct shape
+        else:
+            # Try to match original shape
+            recon = recon.reshape(original_shape) if recon.numel() == x.numel() else recon
+        
         recon = recon.float().clamp(0, 1).cpu()
         return recon
 
@@ -272,6 +289,28 @@ def extract_msillm_identifier_from_checkpoint_path(checkpoint_path: Path) -> Opt
     
     return None
 
+class WandbConfigCallback(Callback):
+    """Callback to update wandb config after wandb is initialized."""
+    def __init__(self, msillm_cfg: Optional[DictConfig] = None, msillm_info: str = ""):
+        super().__init__()
+        self.msillm_cfg = msillm_cfg
+        self.msillm_info = msillm_info
+    
+    def on_train_start(self, trainer, pl_module):
+        """Update wandb config when training starts (wandb.run is available)."""
+        if wandb.run is None:
+            log_rank_0("Warning: wandb.run is None, skipping wandb config update")
+            return
+        
+        if self.msillm_cfg is not None and self.msillm_info:
+            wandb.config.update({
+                "msillm_hub_repo": self.msillm_cfg.get("hub_repo", "unknown"),
+                "msillm_entrypoint": self.msillm_cfg.get("entrypoint", "unknown"),
+                "msillm_pretrained": self.msillm_cfg.get("pretrained", False),
+                "msillm_identifier": self.msillm_info,
+            }, allow_val_change=True)
+            log_rank_0(f"Updated wandb config with MS-ILLM information")
+
 def setup_callbacks(callbacks_cfg: DictConfig, msillm_info: str = "") -> list[Callback]:
     result = []
     for cb_name, cb_cfg in callbacks_cfg.items():
@@ -313,24 +352,12 @@ def setup_logger(cfg: DictConfig, model: LightningModule):
     
     logger_instance = hydra.utils.instantiate(cfg.logger)
     
-    # Set tags and config for wandb
-    if msillm_info and hasattr(logger_instance, 'experiment') and logger_instance.experiment is not None:
-        try:
-            msillm_tags = [msillm_info, "msillm-training"]
+    # Set tags and config for wandb (best-effort)
+    # Note: wandb.run is initialized when Trainer starts, so we check logger_instance.experiment
+    if msillm_info and hasattr(logger_instance, 'experiment'):
             if hasattr(logger_instance, 'tags'):
                 existing_tags = logger_instance.tags or []
-                logger_instance.tags = existing_tags + msillm_tags if isinstance(existing_tags, list) else msillm_tags
-            
-            if "msillm" in cfg and wandb.run is not None:
-                msillm_cfg = cfg.msillm
-                wandb.config.update({
-                    "msillm_hub_repo": msillm_cfg.get("hub_repo", "unknown"),
-                    "msillm_entrypoint": msillm_cfg.get("entrypoint", "unknown"),
-                    "msillm_pretrained": msillm_cfg.get("pretrained", False),
-                    "msillm_identifier": msillm_info,
-                })
-        except Exception:
-            pass  # Best-effort wandb configuration
+            logger_instance.tags = existing_tags + [msillm_info, "msillm-training"] if isinstance(existing_tags, list) else [msillm_info, "msillm-training"]
     
     return logger_instance
 
@@ -361,14 +388,25 @@ def load_pretrained_weights_from_hf(model: LightningModule, repo_id: str, filena
         state_dict = load_file(ckpt_path)
         
         # Handle potential key prefixes (e.g., "state_dict.", "model.")
+        # Note: Hugging Face checkpoints have 'model.' prefix removed during save (save_to_hf.py)
+        # So 'inner_model.*' keys need to be mapped back to 'model.inner_model.*'
         fixed_state_dict = {}
+        inner_model_keys_fixed = 0
         for k, v in state_dict.items():
             k2 = k
             if k2.startswith("state_dict."):
                 k2 = k2[len("state_dict."):]
             if k2.startswith("model."):
                 k2 = k2[len("model."):]
+            # Handle inner_model.* keys that need to be mapped to model.inner_model.*
+            # (because save_to_hf.py removes 'model.' prefix, so inner_model.* -> model.inner_model.*)
+            if k2.startswith("inner_model."):
+                k2 = "model." + k2
+                inner_model_keys_fixed += 1
             fixed_state_dict[k2] = v
+        
+        if inner_model_keys_fixed > 0:
+            log_rank_0(f"Fixed {inner_model_keys_fixed} inner_model.* keys to model.inner_model.*")
         
         missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
         log_rank_0(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
@@ -500,14 +538,9 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule) -> Optio
 def attach_compression_to_datamodule(datamodule, compression_model: Optional[torch.nn.Module], compression_cfg: Optional[DictConfig]) -> None:
     """
     Prepend the image compression transform to datamodule transforms so Phase 2
-    consumes reconstructed images.
+    consumes reconstructed images. Uses compression_model's compress/decompress or forward method.
     """
     if compression_model is None or not hasattr(datamodule, "transforms") or datamodule.transforms is None:
-        return
-
-    encoder, decoder = extract_compression_modules(compression_model)
-    if encoder is None:
-        log_rank_0("Image compression model provided but no encoder found; skipping transform injection.")
         return
 
     device = "cpu"
@@ -515,20 +548,18 @@ def attach_compression_to_datamodule(datamodule, compression_model: Optional[tor
         device = compression_cfg.inference_device
 
     # If transforms are still configs, instantiate them so we can prepend callables.
-    try:
         datamodule.transforms = hydra.utils.instantiate(datamodule.transforms)
-    except Exception as e:
-        log_rank_0(f"Failed to instantiate transforms before injection: {e}")
-        return
 
-    transform = ImageCompressionTransform(encoder=encoder, decoder=decoder, device=device)
+    # Use the full compression model with forward method (same as training)
+    transform = ImageCompressionTransform(compression_model=compression_model, device=device)
     for split in ("train", "val"):
         if split not in datamodule.transforms:
             continue
         # Only apply compression transform to static images, not gripper images
         if "rgb_static" in datamodule.transforms[split]:
             datamodule.transforms[split]["rgb_static"] = [transform] + list(datamodule.transforms[split]["rgb_static"])
-    log_rank_0("Injected image compression transform into datamodule transforms (static images only).")
+    
+    log_rank_0("Injected image compression transform into datamodule transforms (static images only, using forward method).")
 
 
 @hydra.main(config_path="../conf", config_name="config_libero_msillm")
@@ -549,8 +580,13 @@ def train(cfg: DictConfig) -> None:
         clear_cuda_cache()
         
         # Initialize components
-        log_rank_0(f"\nInitializing training for seed {cfg.seed}")
+        log_rank_0(f"\n{'='*60}")
+        log_rank_0(f"Initializing training for seed {cfg.seed}")
+        log_rank_0(f"{'='*60}")
         datamodule = hydra.utils.instantiate(cfg.datamodule)
+        
+        # Log dataset info
+        log_rank_0(f"DataModule initialized: {type(datamodule).__name__}")
 
         # Check for resume checkpoint (env var > config > auto-detect)
         last_checkpoint = None
@@ -596,6 +632,15 @@ def train(cfg: DictConfig) -> None:
                 setattr(model, "msillm_model", msillm_model)
             msillm_keys = [k for k in model.state_dict().keys() if k.startswith("msillm_model")]
             log_rank_0(f"MS-ILLM attached: {len(msillm_keys)} params will be saved")
+            
+            # Log MS-ILLM model details
+            encoder, decoder = extract_compression_modules(msillm_model)
+            if encoder is not None:
+                enc_params = _count_params(encoder)
+                log_rank_0(f"  MS-ILLM encoder: {enc_params[0]:,} total params ({enc_params[1]:,} trainable)")
+            if decoder is not None:
+                dec_params = _count_params(decoder)
+                log_rank_0(f"  MS-ILLM decoder: {dec_params[0]:,} total params ({dec_params[1]:,} trainable)")
         
         # Configure which modules to train/freeze based on config
         # Default: train only vision encoders and MS-ILLM decoder
@@ -674,7 +719,13 @@ def train(cfg: DictConfig) -> None:
             if checkpoint_msillm_info:
                 msillm_info = checkpoint_msillm_info
         
+        # Create wandb config callback to update config when training starts
+        msillm_cfg_for_callback = cfg.msillm if msillm_info and "msillm" in cfg else None
+        wandb_config_callback = WandbConfigCallback(msillm_cfg=msillm_cfg_for_callback, msillm_info=msillm_info) if msillm_info else None
+        
         callbacks = setup_callbacks(cfg.callbacks, msillm_info=msillm_info) + [LearningRateMonitor(logging_interval="step")]
+        if wandb_config_callback is not None:
+            callbacks.append(wandb_config_callback)
         
         # Set unique working directory for each seed
         work_dir = Path.cwd() / f"seed_{cfg.seed}"
@@ -692,6 +743,7 @@ def train(cfg: DictConfig) -> None:
             "use_distributed_sampler": True,
             "default_root_dir": work_dir,
             "sync_batchnorm": True,
+            "log_every_n_steps": cfg.trainer.get("log_every_n_steps", 1),  # Log every step (default: 1 for step 0 logging)
         }
         
         # Log checkpoint save path
@@ -704,6 +756,20 @@ def train(cfg: DictConfig) -> None:
         log_rank_0(f"Training config for seed {cfg.seed}:\n{cfg}")
         log_rank_0(f"Git commit: {get_git_commit_hash(Path(hydra.utils.to_absolute_path(__file__)))}")
         log_rank_0(print_system_env_info())
+        
+        # Log training setup details
+        log_rank_0(f"\n{'='*60}")
+        log_rank_0(f"Training Setup Summary:")
+        log_rank_0(f"{'='*60}")
+        log_rank_0(f"Seed: {cfg.seed}")
+        log_rank_0(f"Max epochs: {cfg.trainer.max_epochs}")
+        log_rank_0(f"Devices: {cfg.trainer.devices}")
+        log_rank_0(f"MS-ILLM identifier: {msillm_info if msillm_info else 'None'}")
+        log_rank_0(f"Train vision encoders: {train_vision_encoders}")
+        log_rank_0(f"Train MS-ILLM encoder: {train_msillm_encoder}")
+        log_rank_0(f"Train MS-ILLM decoder: {train_msillm_decoder}")
+        log_rank_0(f"Work directory: {work_dir}")
+        log_rank_0(f"{'='*60}\n")
                 
         # Clear CUDA cache again before training
         clear_cuda_cache()
@@ -716,8 +782,24 @@ def train(cfg: DictConfig) -> None:
         if last_checkpoint is not None:
             fit_kwargs["ckpt_path"] = last_checkpoint.as_posix()
             log_rank_0(f"Resuming training from checkpoint: {last_checkpoint}")
+            # Log checkpoint details
+            checkpoint_info = torch.load(last_checkpoint.as_posix(), map_location='cpu', weights_only=False)
+            if 'epoch' in checkpoint_info:
+                log_rank_0(f"  Checkpoint epoch: {checkpoint_info['epoch']}")
+            if 'global_step' in checkpoint_info:
+                log_rank_0(f"  Checkpoint global_step: {checkpoint_info['global_step']}")
+            if 'lr_schedulers' in checkpoint_info:
+                log_rank_0(f"  Checkpoint contains LR scheduler state")
+        
+        log_rank_0(f"\n{'='*60}")
+        log_rank_0(f"Starting training...")
+        log_rank_0(f"{'='*60}\n")
         
         trainer.fit(model, datamodule=datamodule, **fit_kwargs)
+        
+        log_rank_0(f"\n{'='*60}")
+        log_rank_0(f"Training completed!")
+        log_rank_0(f"{'='*60}\n")
                 
     except Exception as e:
         logger.error(f"Training failed for seed {cfg.seed}: {e}")

@@ -1,13 +1,18 @@
 defaults:
   - datamodule: libero
   - model: mode_agent
+  - _self_
 
 eval_cfg_overwrite:
   model:
     num_sampling_steps: 10
+  msillm:
+    hub_repo: facebookresearch/NeuralCompression:main
+    entrypoint: msillm_quality_1  # Default MS-ILLM quality variant (can be overridden via CLI: eval_cfg_overwrite.msillm.entrypoint=msillm_quality_2, etc.)
+    pretrained: true
 
 train_folder: /home/hjkim/MoDE_Diffusion_Policy/saved_models
-checkpoint: msillm-NeuralCompression_main-msillm_quality_vlo1_epoch24.ckpt
+checkpoint: null  # Set to null to use pretrain_chk from config_libero_msillm.yaml, or specify checkpoint path/Hugging Face repo ID
 device: 0
 
 log_dir: /home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval
@@ -35,7 +40,7 @@ benchmark_name: libero_10 # [LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_
 
 hydra:
   run:
-    dir: outputs/${checkpoint}  # Directory name includes .ckpt, but we'll use checkpoint stem in code
+    dir: outputs/eval  # Directory will be updated in code based on checkpoint
   job:
-    name: ${checkpoint}  # Job name includes .ckpt extension
+    name: "libero_msillm_eval"  # Default job name (will be updated if checkpoint is provided)
 
