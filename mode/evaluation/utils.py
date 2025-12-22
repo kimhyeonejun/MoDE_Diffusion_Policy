@@ -542,13 +542,13 @@ def patch_modeagent_embed_visual_obs_for_msillm(model):
 
         recon = recon.reshape(b, t, c, h, w)
         
-        # Store reconstructed image in [0, 1] range for video (recon is already in [0, 1])
-        if hasattr(model, '_store_reconstructed_frame') and hasattr(model, 'msillm_model') and model.msillm_model is not None:
-            # Take last timestep and first batch, convert to numpy [H, W, C] in [0, 255] range
-            recon_frame = recon[0, -1] if recon.dim() == 5 else recon[0]  # [C, H, W]
-            rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))  # Rotate 180 degrees
-            model._last_reconstructed_frame = rgb_recon_np[..., ::-1]  # RGB to BGR for cv2
+        # Store reconstructed image tensor (still on GPU) for video conversion (only if needed this step)
+        # This avoids GPU-CPU sync when not saving video
+        if hasattr(model, '_save_frame_this_step') and model._save_frame_this_step and hasattr(model, '_store_reconstructed_frame') and hasattr(model, 'msillm_model') and model.msillm_model is not None:
+            # Store as tensor to avoid GPU-CPU sync
+            recon_frame = recon[0, -1] if recon.dim() == 5 else recon[0]  # [C, H, W], still on GPU
+            model._last_reconstructed_frame_tensor = recon_frame  # Store tensor version
+            model._save_frame_this_step = False  # Reset flag
         
         out = (recon - mean) / std
         return out
@@ -676,15 +676,15 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
         sd = torch.load(weight_file, map_location='cpu', weights_only=False)
         # Try EMA weights first
         if "callbacks" in sd and "EMA" in sd["callbacks"] and "ema_weights" in sd["callbacks"]["EMA"]:
-            ema_weights_list = sd["callbacks"]["EMA"]["ema_weights"]
-            model_state_dict = model.state_dict()
-            ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(model_state_dict.items()) if i < len(ema_weights_list)}
-            if ema_weights_dict:
-                model.load_state_dict(ema_weights_dict, strict=False)
-                print("Successfully loaded EMA weights from checkpoint!")
-            else:
-                model.load_state_dict(sd.get("state_dict", sd), strict=False)
-                print("Loaded regular weights (EMA weights not found)")
+            #ema_weights_list = sd["callbacks"]["EMA"]["ema_weights"]
+            #model_state_dict = model.state_dict()
+            #ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(model_state_dict.items()) if i < len(ema_weights_list)}
+            # if ema_weights_dict:
+            #     model.load_state_dict(ema_weights_dict, strict=False)
+            #     print("Successfully loaded EMA weights from checkpoint!")
+            # else:
+            model.load_state_dict(sd.get("state_dict", sd), strict=False)
+            print("Loaded regular weights (EMA weights not found)")
         else:
             model.load_state_dict(sd.get("state_dict", sd), strict=False)
             print("Loaded regular weights")

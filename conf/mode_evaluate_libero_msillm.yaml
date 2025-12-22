@@ -18,6 +18,7 @@ device: 0
 log_dir: /home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval
 dataset_path: /tmp
 num_videos: 1
+use_reconstructed_video: false  # If true, save MS-ILLM reconstructed images to video; if false, save original env images
 debug: False
 
 log_wandb: True

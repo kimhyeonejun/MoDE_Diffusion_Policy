@@ -327,6 +327,11 @@ class EvaluateLibero:
                 if compress_method is not None:
                     compress_method.clear()
                 
+                # Store flag for video saving before model.step
+                save_frame_this_step = store_video_this_rollout and hasattr(model, '_store_reconstructed_frame')
+                if save_frame_this_step:
+                    model._save_frame_this_step = True
+                
                 actions = model.step(data, goal)
                 
                 # Calculate BPP from captured latents (only rgb_static is compressed)
@@ -357,12 +362,20 @@ class EvaluateLibero:
                 obs, reward, done, info = env.step(actions)
 
                 if store_video_this_rollout:
-                    # Use reconstructed image if available (MS-ILLM restored), otherwise use original
-                    if hasattr(model, '_store_reconstructed_frame') and hasattr(model, '_last_reconstructed_frame'):
-                        # Use MS-ILLM reconstructed frame
-                        frame = model._last_reconstructed_frame
+                    # Use reconstructed image if flag is set, otherwise use original (which is already numpy)
+                    if (hasattr(model, '_store_reconstructed_frame') and 
+                        model._store_reconstructed_frame and 
+                        hasattr(model, '_last_reconstructed_frame_tensor')):
+                        # Only convert GPU tensor to numpy when using reconstructed frames
+                        # Note: This GPU->CPU transfer is necessary because:
+                        # 1. PyTorch GPU tensors cannot be directly converted to numpy
+                        # 2. cv2.VideoWriter only accepts numpy arrays
+                        recon_frame = model._last_reconstructed_frame_tensor  # [C, H, W] tensor on GPU
+                        rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                        rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))  # Rotate 180 degrees
+                        frame = rgb_recon_np[..., ::-1]  # RGB to BGR for cv2
                     else:
-                        # Fallback to original frame
+                        # Use original frame (already numpy, no GPU->CPU transfer needed)
                         frame = obs['agentview_image']
                         # Fix: Rotate 180 degrees and convert RGB to BGR for cv2
                         if isinstance(frame, np.ndarray):
@@ -568,6 +581,18 @@ def main(cfg: DictConfig):
     else:
         print(f"[BPP] WARNING: No wrapper created - BPP measurement may not work")
     
+    # Enable storing reconstructed frames for video (if MS-ILLM is used and config allows it)
+    use_reconstructed = getattr(cfg, 'use_reconstructed_video', True)  # Default to True for backward compatibility
+    if hasattr(model, 'msillm_model') and model.msillm_model is not None and use_reconstructed:
+        model._store_reconstructed_frame = True
+        print("[Video] Will save MS-ILLM reconstructed images to video")
+    else:
+        model._store_reconstructed_frame = False
+        if hasattr(model, 'msillm_model') and model.msillm_model is not None:
+            print("[Video] Will save original env images to video (use_reconstructed_video=False)")
+        else:
+            print("[Video] Will save original env images to video (no MS-ILLM model)")
+    
     # Ensure DataModule is setup to load statistics
     if not hasattr(dm, 'train_datasets') or not dm.train_datasets:
         dm.setup()
@@ -648,6 +673,14 @@ def main(cfg: DictConfig):
                 entity = None
         if run_id in ("null", ""):
             run_id = None
+        
+        # Generate unique run_id if not provided to avoid HTTP 409 conflicts
+        if run_id is None:
+            import time
+            import hashlib
+            # Create unique run_id based on checkpoint name and timestamp
+            unique_str = f"{checkpoint_stem}_{time.time()}"
+            run_id = hashlib.md5(unique_str.encode()).hexdigest()[:16]
 
         run = wandb.init(
             project=project,
@@ -658,7 +691,7 @@ def main(cfg: DictConfig):
             dir=str(log_dir / "wandb"),
             mode=mode,
             id=run_id,
-            allow_val_change=True,
+            resume="allow",  # Allow resuming if run_id exists (though unlikely with unique IDs)
         )
 
     eval_libero.setup()

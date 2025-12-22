@@ -113,14 +113,14 @@ def _patch_optimizer_to_only_train_selected(
         # Lightning allows returning optimizer or dict with optimizer/scheduler.
         optimizer = out["optimizer"] if isinstance(out, dict) and "optimizer" in out else out
         # Filter out any frozen params from existing param groups.
-            if hasattr(optimizer, "param_groups"):
-                new_groups = []
-                for g in optimizer.param_groups:
-                    params = [p for p in g.get("params", []) if getattr(p, "requires_grad", False)]
-                    if params:
-                        g["params"] = params
-                        new_groups.append(g)
-                optimizer.param_groups = new_groups
+        if hasattr(optimizer, "param_groups"):
+            new_groups = []
+            for g in optimizer.param_groups:
+                params = [p for p in g.get("params", []) if getattr(p, "requires_grad", False)]
+                if params:
+                    g["params"] = params
+                    new_groups.append(g)
+            optimizer.param_groups = new_groups
         if hasattr(optimizer, "add_param_group"):
             params = [p for p in extra_trainable_module.parameters() if p.requires_grad]
             if params:
@@ -342,22 +342,31 @@ def setup_logger(cfg: DictConfig, model: LightningModule):
     
     if "group" in cfg.logger:
         cfg.logger.group = pathlib_cwd.parent.name
+        seed = cfg.get("seed", None)
         if msillm_info:
             cfg.logger.name = msillm_info
-            cfg.logger.id = msillm_info.replace("/", "_").replace(":", "_")
+            # Include seed in ID to make it unique and avoid conflicts
+            # Only set ID if not already set by environment variable
+            if cfg.logger.get("id") is None or cfg.logger.get("id") == "null":
+                base_id = msillm_info.replace("/", "_").replace(":", "_")
+                cfg.logger.id = f"{base_id}_seed{seed}" if seed is not None else base_id
         else:
             base_name = f"{pathlib_cwd.parent.name}/{pathlib_cwd.name}"
             cfg.logger.name = base_name
-            cfg.logger.id = cfg.logger.name.replace("/", "_").replace(":", "_")
+            # Only set ID if not already set by environment variable
+            if cfg.logger.get("id") is None or cfg.logger.get("id") == "null":
+                base_id = cfg.logger.name.replace("/", "_").replace(":", "_")
+                cfg.logger.id = f"{base_id}_seed{seed}" if seed is not None else base_id
+    
+    # Set tags for wandb before instantiation (to avoid triggering wandb.init early)
+    # WandbLogger accepts tags parameter during initialization
+    # if msillm_info and cfg.logger.get("_target_", "").endswith("WandbLogger"):
+    #     existing_tags = cfg.logger.get("tags", [])
+    #     if not isinstance(existing_tags, list):
+    #         existing_tags = []
+    #     cfg.logger.tags = existing_tags + [msillm_info, "msillm-training"]
     
     logger_instance = hydra.utils.instantiate(cfg.logger)
-    
-    # Set tags and config for wandb (best-effort)
-    # Note: wandb.run is initialized when Trainer starts, so we check logger_instance.experiment
-    if msillm_info and hasattr(logger_instance, 'experiment'):
-            if hasattr(logger_instance, 'tags'):
-                existing_tags = logger_instance.tags or []
-            logger_instance.tags = existing_tags + [msillm_info, "msillm-training"] if isinstance(existing_tags, list) else [msillm_info, "msillm-training"]
     
     return logger_instance
 

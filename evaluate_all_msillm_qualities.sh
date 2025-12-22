@@ -38,6 +38,9 @@ echo ""
 
 # Function to run evaluation
 run_evaluation() {
+    # Temporarily disable exit on error for this function
+    set +e
+    
     local checkpoint=$1
     local msillm_entrypoint=$2
     local description=$3
@@ -65,20 +68,36 @@ run_evaluation() {
     echo ""
     
     # Run evaluation with CPU affinity
+    # Try taskset first, fallback to direct execution if taskset fails
     local start_time=$(date +%s)
-    if taskset -c 19,20 bash -c "${cmd}"; then
-        local end_time=$(date +%s)
-        local duration=$((end_time - start_time))
-        echo -e "${GREEN}✓ Successfully completed: ${description} (took ${duration}s)${NC}"
+    local exit_code=0
+    
+    if command -v taskset >/dev/null 2>&1; then
+        taskset -c 23,24 bash -c "${cmd}" 2>&1
+        exit_code=$?
     else
-        local end_time=$(date +%s)
-        local duration=$((end_time - start_time))
-        echo -e "${RED}✗ Failed: ${description} (after ${duration}s)${NC}"
-        return 1
+        echo -e "${YELLOW}Warning: taskset not available, running without CPU affinity${NC}"
+        bash -c "${cmd}" 2>&1
+        exit_code=$?
     fi
     
-    echo ""
-    sleep 2  # Brief pause between evaluations
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    # Re-enable exit on error
+    set -e
+    
+    if [ $exit_code -eq 0 ]; then
+        echo -e "${GREEN}✓ Successfully completed: ${description} (took ${duration}s)${NC}"
+        echo ""
+        sleep 2  # Brief pause between evaluations
+        return 0
+    else
+        echo -e "${RED}✗ Failed: ${description} (after ${duration}s, exit code: ${exit_code})${NC}"
+        echo ""
+        sleep 2  # Brief pause between evaluations
+        return 1
+    fi
 }
 
 # Track results
@@ -91,9 +110,9 @@ FAILED_TESTS=()
 EVALUATIONS=()
 
 # Add ALL MS-ILLM quality variants (vlo1, vlo2, 1-6)
-EVALUATIONS+=("null|msillm_quality_vlo1|MS-ILLM Quality VLO1")
-EVALUATIONS+=("null|msillm_quality_vlo2|MS-ILLM Quality VLO2")
-EVALUATIONS+=("null|msillm_quality_1|MS-ILLM Quality 1")
+#EVALUATIONS+=("null|msillm_quality_vlo1|MS-ILLM Quality VLO1")
+#EVALUATIONS+=("null|msillm_quality_vlo2|MS-ILLM Quality VLO2")
+#EVALUATIONS+=("null|msillm_quality_1|MS-ILLM Quality 1")
 EVALUATIONS+=("null|msillm_quality_2|MS-ILLM Quality 2")
 EVALUATIONS+=("null|msillm_quality_3|MS-ILLM Quality 3")
 EVALUATIONS+=("null|msillm_quality_4|MS-ILLM Quality 4")
@@ -104,15 +123,22 @@ TOTAL=${#EVALUATIONS[@]}
 
 # Run all evaluations
 for i in "${!EVALUATIONS[@]}"; do
+    # Temporarily disable exit on error for array operations
+    set +e
     IFS='|' read -r checkpoint entrypoint description <<< "${EVALUATIONS[$i]}"
+    set -e
+    
     index=$((i + 1))
     
+    # Temporarily disable exit on error for function call and arithmetic
+    set +e
     if run_evaluation "${checkpoint}" "${entrypoint}" "${description}" ${index} ${TOTAL}; then
-        ((PASSED++))
+        ((PASSED++)) || true  # || true prevents exit on arithmetic failure
     else
-        ((FAILED++))
+        ((FAILED++)) || true  # || true prevents exit on arithmetic failure
         FAILED_TESTS+=("${description}")
     fi
+    set -e
 done
 
 # Summary
