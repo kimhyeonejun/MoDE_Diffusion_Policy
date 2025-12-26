@@ -1,0 +1,15 @@
+eval_cfg_overwrite:
+  datamodule:
+    datasets:
+      lang_dataset:
+        lang_folder: lang_annotations
+  model:
+    num_sampling_steps: 10
+
+train_folder: /home/i53/student/yagmurlu/code/MoDE_Diffusion_Policy/pretrained/
+checkpoint: unknown=0
+device: 0
+dataset_path: /home/i53/student/yagmurlu/code/manten/calvin/dataset/calvin_debug_dataset
+
+host: "localhost"
+port: 12567

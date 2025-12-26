@@ -1,0 +1,37 @@
+defaults:
+  - datamodule: libero
+  - model: mode_agent
+
+eval_cfg_overwrite:
+  datamodule:
+    datasets:
+      lang_dataset:
+        lang_folder: lang_annotations
+  model:
+    num_sampling_steps: 10
+
+train_folder: /home/hjkim/MoDE_Diffusion_Policy/saved_models
+checkpoint: "mbreuss/MoDE_LIBERO_10"
+device: 0
+
+log_dir: /home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval
+dataset_path: /tmp
+num_videos: 30
+debug: False
+
+log_wandb: True
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
+
+num_sampling_steps: null
+sampler_type: null
+multistep: null
+sigma_min: null
+sigma_max: null
+noise_scheduler: null
+
+num_sequences: 50
+max_steps: 520
+n_eval: 50
+task_embedding_format: clip
+
+benchmark_name: libero_10 # [LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_90, LIBERO_10]

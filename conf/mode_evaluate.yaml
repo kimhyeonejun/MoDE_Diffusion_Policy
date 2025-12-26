@@ -1,0 +1,34 @@
+defaults:
+  - annotations: new_playtable_validation
+  - callbacks/rollout_lh/tasks@tasks: new_playtable_tasks
+
+eval_cfg_overwrite:
+  datamodule:
+    datasets:
+      lang_dataset:
+        lang_folder: lang_annotations
+  model:
+    num_sampling_steps: 5
+
+train_folder: /home/yagmurlu/code/MoDE_Diffusion_Policy/pretrained/
+checkpoint: d_ema=0
+device: 0
+
+
+log_dir: /home/yagmurlu/code/MoDE_Diffusion_Policy/outputs/d_ema
+dataset_path: /home/yagmurlu/code/mdt_policy/dataset/calvin_debug_dataset
+num_videos: 30
+debug: False
+
+log_wandb: True
+wandb_entity: omeryagmurlu
+
+num_sampling_steps: null
+sampler_type: null
+multistep: null
+sigma_min: 1.0
+sigma_max: null
+noise_scheduler: null
+
+num_sequences: 1000
+ep_len: 360

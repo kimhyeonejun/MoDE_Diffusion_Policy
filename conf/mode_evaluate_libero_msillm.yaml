@@ -1,0 +1,47 @@
+defaults:
+  - datamodule: libero
+  - model: mode_agent
+  - _self_
+
+eval_cfg_overwrite:
+  model:
+    num_sampling_steps: 10
+  msillm:
+    hub_repo: facebookresearch/NeuralCompression:main
+    entrypoint: msillm_quality_1  # Default MS-ILLM quality variant (can be overridden via CLI: eval_cfg_overwrite.msillm.entrypoint=msillm_quality_2, etc.)
+    pretrained: true
+
+train_folder: /home/hjkim/MoDE_Diffusion_Policy/saved_models
+checkpoint: null  # Set to null to use pretrain_chk from config_libero_msillm.yaml, or specify checkpoint path/Hugging Face repo ID
+device: 0
+
+log_dir: /home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval
+dataset_path: /tmp
+num_videos: 1
+use_reconstructed_video: false  # If true, save MS-ILLM reconstructed images to video; if false, save original env images
+debug: False
+
+log_wandb: True
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
+
+
+num_sampling_steps: null
+sampler_type: null
+multistep: null
+sigma_min: null
+sigma_max: null
+noise_scheduler: null
+
+num_sequences: 50
+max_steps: 520
+n_eval: 50
+task_embedding_format: clip
+
+benchmark_name: libero_10 # [LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_90, LIBERO_10]
+
+hydra:
+  run:
+    dir: outputs/eval  # Directory will be updated in code based on checkpoint
+  job:
+    name: "libero_msillm_eval"  # Default job name (will be updated if checkpoint is provided)
+

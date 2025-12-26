@@ -1,0 +1,82 @@
+_target_: mode.models.mode_agent.MoDEAgent
+_recursive_: false
+multistep: ${multistep}
+use_lr_scheduler: True
+entropy_gamma: 0.0 # note for finetuning we use 0.0 for training from scratch we need 0.01 
+router_z_delta: 0.00 
+use_proprio: False
+seed: ${seed}
+sampler_type: 'ddim'
+num_sampling_steps: 10
+sigma_data: 0.5
+sigma_min: 0.001
+sigma_max: 80
+noise_scheduler: 'exponential'
+sigma_sample_density_type: 'loglogistic' # 'loglogistic' or 'loguniform'
+ckpt_path: null  # Use pretrain_chk in config_libero.yaml for Hugging Face pretrained weights
+start_from_pretrained: False  # Will be handled by training script via pretrain_chk
+act_window_size: ${act_seq_len}
+latent_dim: 1024
+obs_enc_dim: ${obs_dim}
+cond_dim: 512
+resnet_type: '50'
+
+optimizer:
+  _target_: torch.optim.AdamW
+  transformer_weight_decay: 0.05
+  obs_encoder_weight_decay: 0.05
+  learning_rate: 1e-4
+  betas: [0.9, 0.95]
+
+lr_scheduler:
+  lr_scheduler:
+    init_lr: 1e-4  # This is the peak or maximum learning rate
+    init_lr_scale: 0.1  # This is the ratio of initial learning rate to peak learning rate
+    final_lr_scale: 1e-6  # This is the ratio of final learning rate to peak learning rate
+    total_steps: 45000  # Example total steps, adjust as needed
+    phase_ratio: "(0.02, 0.08, 0.9)"
+    lr: 1e-4
+
+model:
+  _target_: mode.models.edm_diffusion.score_wrappers.GCDenoiser
+  _recursive_: false
+
+  sigma_data: ${model.sigma_data}
+
+  inner_model:
+    _target_: mode.models.networks.modedit.MoDeDiT
+    action_dim: ${datamodule.action_space}
+    goal_dim: ${model.cond_dim}
+    obs_dim: ${obs_dim}
+    goal_conditioned: True
+    causal: True
+    use_custom_attn_mask: False
+    use_proprio: ${model.use_proprio}
+    state_dim: ${proprio_dims}
+    embed_dim: ${model.latent_dim}
+    n_layers: 12
+    goal_seq_len: 1
+    obs_seq_len: ${obs_seq_len}
+    action_seq_len: ${act_seq_len}
+    embed_pdrob: 0
+    goal_drop: 0.1
+    attn_pdrop: 0.3
+    mlp_pdrop: 0.1
+    n_heads: 8
+    device: ${device}
+    linear_output: True
+    cond_router: True 
+    num_experts: 4
+    top_k: 2
+    router_normalize: True
+    use_goal_in_routing: False
+    use_argmax: False
+    use_shared_expert: False
+    use_noise_token_as_input: True
+    init_style: 'olmoe'
+
+
+language_goal:
+  _target_:  mode.models.networks.clip_lang_encoder.LangClip
+  _recursive_: false
+  model_name: ${clip_lang_model_name}
