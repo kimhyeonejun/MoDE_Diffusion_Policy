@@ -27,7 +27,7 @@ if libero_repo_dir.exists():
     current_pythonpath = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
 
-from mode.evaluation.utils import get_msillm_mode_and_env
+from mode.evaluation.utils import get_msillm_mode_and_env, reconstruct_frame_for_video
 from mode.evaluation.multistep_sequences import get_sequences
 from mode.utils.bpp_utils import (
     calculate_bpp_from_encoder_output,
@@ -334,12 +334,35 @@ class EvaluateLibero:
                 
                 actions = model.step(data, goal)
                 
+                # Fix for stuttering video: if model.step() didn't run inference (action chunking),
+                # manually reconstruct frame for smooth video. This ensures every step has a fresh frame.
+                if (store_video_this_rollout 
+                    and hasattr(model, '_store_reconstructed_frame') 
+                    and model._store_reconstructed_frame
+                    and hasattr(model, '_save_frame_this_step')
+                    and model._save_frame_this_step
+                    and "rgb_static" in data["rgb_obs"]):
+                    recon_frame = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_static"])
+                    if recon_frame is not None:
+                        model._last_reconstructed_frame_tensor = recon_frame
+                    model._save_frame_this_step = False
+
                 # Calculate BPP from captured latents (rgb_static + rgb_gripper)
-                if compress_method is not None and len(compress_method.latents) > 0:
+                # Get compress_method wrapper if available
+                bpp_compress_method = getattr(model, "_bpp_wrapper", None)
+                if bpp_compress_method is None:
+                    msillm_model = getattr(model, "msillm_model", None)
+                    if msillm_model is not None:
+                        if hasattr(msillm_model, "compress") and isinstance(msillm_model.compress, LatentCaptureWrapper):
+                            bpp_compress_method = msillm_model.compress
+                        elif hasattr(msillm_model, "encoder") and hasattr(msillm_model.encoder, "forward") and isinstance(msillm_model.encoder.forward, LatentCaptureWrapper):
+                            bpp_compress_method = msillm_model.encoder.forward
+                
+                if bpp_compress_method is not None and len(bpp_compress_method.latents) > 0:
                     bpp_dict = {}
                     sensors = [k for k in ("rgb_static", "rgb_gripper") if k in data.get("rgb_obs", {})]
                     # Map most recent latents to sensors in call order
-                    latents = compress_method.latents[-len(sensors):]
+                    latents = bpp_compress_method.latents[-len(sensors):]
                     for sensor_name, latent in zip(sensors, latents):
                         img = data["rgb_obs"][sensor_name]  # (1, C, H, W)
                         img_for_bpp = img.squeeze(0)  # (C, H, W)

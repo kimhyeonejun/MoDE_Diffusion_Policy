@@ -122,12 +122,12 @@ TRAININGS=()
 
 # Add ALL MS-ILLM quality variants (vlo1, vlo2, 1-6)
 # Uncomment the ones you want to train
-TRAININGS+=("msillm_quality_vlo1|MS-ILLM Quality VLO1")
-TRAININGS+=("msillm_quality_vlo2|MS-ILLM Quality VLO2")
-TRAININGS+=("msillm_quality_1|MS-ILLM Quality 1")
-TRAININGS+=("msillm_quality_2|MS-ILLM Quality 2")
-TRAININGS+=("msillm_quality_3|MS-ILLM Quality 3")
-TRAININGS+=("msillm_quality_4|MS-ILLM Quality 4")
+#TRAININGS+=("msillm_quality_vlo1|MS-ILLM Quality VLO1")
+#TRAININGS+=("msillm_quality_vlo2|MS-ILLM Quality VLO2")
+#TRAININGS+=("msillm_quality_1|MS-ILLM Quality 1")
+#TRAININGS+=("msillm_quality_2|MS-ILLM Quality 2")
+#TRAININGS+=("msillm_quality_3|MS-ILLM Quality 3")
+#TRAININGS+=("msillm_quality_4|MS-ILLM Quality 4")
 TRAININGS+=("msillm_quality_5|MS-ILLM Quality 5")
 TRAININGS+=("msillm_quality_6|MS-ILLM Quality 6")
 

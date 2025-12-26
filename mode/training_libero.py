@@ -15,7 +15,7 @@ from pytorch_lightning.utilities import rank_zero_only
 # This is for using the locally installed repo clone when using slurm
 sys.path.insert(0, Path(__file__).absolute().parents[1].as_posix())
 import mode.models.mode_agent as models_m
-from mode.utils.utils import get_git_commit_hash, get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
+from mode.utils.utils import get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
 
 # Add local repo to path
 sys.path.insert(0, str(Path(__file__).absolute().parents[1]))
@@ -104,7 +104,6 @@ def train(cfg: DictConfig) -> None:
         
         # Log configuration
         log_rank_0(f"Training config for seed {cfg.seed}:\n{cfg}")
-        log_rank_0(f"Git commit: {get_git_commit_hash(Path(hydra.utils.to_absolute_path(__file__)))}")
         log_rank_0(print_system_env_info())
                 
         # Clear CUDA cache again before training

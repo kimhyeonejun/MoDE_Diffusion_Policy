@@ -31,7 +31,7 @@ if libero_repo_dir.exists():
     os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
 
 import mode.models.mode_agent as models_m
-from mode.utils.utils import get_git_commit_hash, get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
+from mode.utils.utils import get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # region agent log helpers
-_DEBUG_LOG_PATH = "/home/hjkim/MoDE_Diffusion_Policy/.cursor/debug.log"
+_DEBUG_LOG_PATH = "/home/khj20343/MoDE_Diffusion_Policy/.cursor/debug.log"
 _DEBUG_SESSION_ID = "debug-session"
 
 def _agent_log(*, runId: str, hypothesisId: str, location: str, message: str, data: dict) -> None:
@@ -132,18 +132,17 @@ def _patch_optimizer_to_only_train_selected(
 
 def _freeze_all_except_vision_encoders(model: LightningModule) -> None:
     """
-    Train ONLY the static_resnet for MoDEAgent:
+    Train both vision encoders for MoDEAgent:
       - `static_resnet` (trainable)
-      - `gripper_resnet` (frozen)
+      - `gripper_resnet` (trainable)
     Everything else is frozen.
     """
     _set_requires_grad(model, False)
-    # Only train static_resnet
+    # Train both static_resnet and gripper_resnet
     static_resnet = getattr(model, "static_resnet", None)
     _set_requires_grad(static_resnet, True)
-    # Keep gripper_resnet frozen
     gripper_resnet = getattr(model, "gripper_resnet", None)
-    _set_requires_grad(gripper_resnet, False)
+    _set_requires_grad(gripper_resnet, True)
 
 def _freeze_compression_encoder_only_train_decoder(compression_model: torch.nn.Module) -> Optional[torch.nn.Module]:
     """
@@ -518,10 +517,9 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule) -> Optio
         return out
 
     def _patched(self, rgb_static, rgb_gripper, latent_goal):  # type: ignore
-        # Apply MS-ILLM reconstruction only to static image so decoder gradients flow from static image only.
-        # Gripper image uses original forward path (no compression).
+        # Apply MS-ILLM reconstruction to both static and gripper images so decoder gradients flow from both.
         rgb_static = _reconstruct_normed(rgb_static)
-        # rgb_gripper is passed through unchanged (no MS-ILLM compression)
+        rgb_gripper = _reconstruct_normed(rgb_gripper)
 
         if not did_log["v"]:
             did_log["v"] = True
@@ -529,15 +527,15 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule) -> Optio
                 runId="joint-train",
                 hypothesisId="msillm-forward",
                 location="mode/training_libero_msillm.py:patch_modeagent_embed_visual_obs_for_msillm",
-                message="Applied forward-time MS-ILLM recon only to static image (encoder no_grad, decoder grad)",
+                message="Applied forward-time MS-ILLM recon to both static and gripper images (encoder no_grad, decoder grad)",
                 data={
                     "rgb_static_shape": list(rgb_static.shape),
                     "rgb_gripper_shape": list(rgb_gripper.shape),
-                    "gripper_compression": False,
+                    "gripper_compression": True,
                 },
             )
 
-        # Call original embed_visual_obs (bound method) with reconstructed static image and original gripper image.
+        # Call original embed_visual_obs (bound method) with reconstructed static and gripper images.
         return orig(rgb_static, rgb_gripper, latent_goal)
 
     # type: ignore[method-assign]
@@ -564,11 +562,13 @@ def attach_compression_to_datamodule(datamodule, compression_model: Optional[tor
     for split in ("train", "val"):
         if split not in datamodule.transforms:
             continue
-        # Only apply compression transform to static images, not gripper images
+        # Apply compression transform to both static and gripper images
         if "rgb_static" in datamodule.transforms[split]:
             datamodule.transforms[split]["rgb_static"] = [transform] + list(datamodule.transforms[split]["rgb_static"])
+        if "rgb_gripper" in datamodule.transforms[split]:
+            datamodule.transforms[split]["rgb_gripper"] = [transform] + list(datamodule.transforms[split]["rgb_gripper"])
     
-    log_rank_0("Injected image compression transform into datamodule transforms (static images only, using forward method).")
+    log_rank_0("Injected image compression transform into datamodule transforms (both static and gripper images, using forward method).")
 
 
 @hydra.main(config_path="../conf", config_name="config_libero_msillm")
@@ -660,7 +660,7 @@ def train(cfg: DictConfig) -> None:
         # Freeze/unfreeze vision encoders
         if train_vision_encoders:
             _freeze_all_except_vision_encoders(model)
-            log_rank_0("Vision encoder (static_resnet) is trainable, gripper_resnet is frozen")
+            log_rank_0("Both vision encoders (static_resnet and gripper_resnet) are trainable")
         else:
             _set_requires_grad(model, False)
             log_rank_0("All model parameters are frozen")
@@ -763,7 +763,6 @@ def train(cfg: DictConfig) -> None:
         
         # Log configuration
         log_rank_0(f"Training config for seed {cfg.seed}:\n{cfg}")
-        log_rank_0(f"Git commit: {get_git_commit_hash(Path(hydra.utils.to_absolute_path(__file__)))}")
         log_rank_0(print_system_env_info())
         
         # Log training setup details

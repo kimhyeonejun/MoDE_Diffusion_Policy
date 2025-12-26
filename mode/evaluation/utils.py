@@ -487,6 +487,50 @@ def _clip_mean_std(device: torch.device, dtype: torch.dtype):
     std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device, dtype=dtype).view(1, 1, 3, 1, 1)
     return mean, std
 
+def reconstruct_frame_for_video(model, rgb_static_tensor):
+    """
+    Reconstruct a single frame using MS-ILLM for video saving.
+    Used when model.step() didn't run inference (due to action chunking).
+    
+    Args:
+        model: Model with msillm_model attribute
+        rgb_static_tensor: Normalized RGB tensor [1, 1, C, H, W] or [1, C, H, W]
+    
+    Returns:
+        Reconstructed frame tensor [C, H, W] on GPU, or None if MS-ILLM not available
+    """
+    msillm = getattr(model, "msillm_model", None)
+    if msillm is None:
+        return None
+    
+    if not hasattr(msillm, "compress") or not hasattr(msillm, "decompress"):
+        return None
+    
+    device = rgb_static_tensor.device
+    mean, std = _clip_mean_std(device, rgb_static_tensor.dtype)
+    
+    # Ensure correct shape: [1, 1, C, H, W] (B, T, C, H, W format)
+    if rgb_static_tensor.dim() == 4:
+        rgb_static_tensor = rgb_static_tensor.unsqueeze(1)  # [1, C, H, W] -> [1, 1, C, H, W]
+    elif rgb_static_tensor.dim() == 5:
+        pass  # Already [B, T, C, H, W]
+    else:
+        return None  # Unexpected shape
+    
+    # Denormalize and reshape to [B*T, C, H, W]
+    x01 = (rgb_static_tensor * std + mean).clamp(0.0, 1.0)
+    b, t, c, h, w = x01.shape
+    x01_bt = x01.reshape(b * t, c, h, w)
+    
+    # Compress/Decompress (this triggers LatentCaptureWrapper if present)
+    with torch.no_grad():
+        compressed = msillm.compress(x01_bt, force_cpu=False)
+        recon = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
+    
+    # Extract single frame: [C, H, W]
+    recon_frame = recon[0] if recon.dim() == 4 else recon.squeeze(0)
+    return recon_frame
+
 def patch_modeagent_embed_visual_obs_for_msillm(model):
     msillm = getattr(model, "msillm_model", None)
     if msillm is None:

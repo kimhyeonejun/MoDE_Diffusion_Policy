@@ -10,11 +10,11 @@ eval_cfg_overwrite:
   model:
     num_sampling_steps: 10
 
-train_folder: /home/hjkim/MoDE_Diffusion_Policy/saved_models
+train_folder: /home/khj20343/MoDE_Diffusion_Policy/saved_models
 checkpoint: "mbreuss/MoDE_LIBERO_10"
 device: 0
 
-log_dir: /home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval
+log_dir: /home/khj20343/MoDE_Diffusion_Policy/outputs/libero_eval
 dataset_path: /tmp
 num_videos: 30
 debug: False

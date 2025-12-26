@@ -11,11 +11,11 @@ eval_cfg_overwrite:
     entrypoint: msillm_quality_1  # Default MS-ILLM quality variant (can be overridden via CLI: eval_cfg_overwrite.msillm.entrypoint=msillm_quality_2, etc.)
     pretrained: true
 
-train_folder: /home/hjkim/MoDE_Diffusion_Policy/saved_models
+train_folder: /home/khj20343/MoDE_Diffusion_Policy/saved_models
 checkpoint: null  # Set to null to use pretrain_chk from config_libero_msillm.yaml, or specify checkpoint path/Hugging Face repo ID
 device: 0
 
-log_dir: /home/hjkim/MoDE_Diffusion_Policy/outputs/libero_eval
+log_dir: /home/khj20343/MoDE_Diffusion_Policy/outputs/libero_eval
 dataset_path: /tmp
 num_videos: 1
 use_reconstructed_video: false  # If true, save MS-ILLM reconstructed images to video; if false, save original env images

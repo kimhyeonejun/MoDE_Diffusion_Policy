@@ -73,6 +73,8 @@ instance/
 
 # Scrapy stuff:
 .scrapy
+slurm_scripts/
+logs/
 
 # Sphinx documentation
 docs/_build/
@@ -161,6 +163,7 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+outputs/
 
 /pretrained
 /outputs
