@@ -10,6 +10,7 @@ import wandb
 import hydra
 from omegaconf import DictConfig
 import torch
+import torch.nn.functional as F
 import types
 from pytorch_lightning import Callback, LightningModule, seed_everything, Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor
@@ -124,7 +125,16 @@ def _patch_optimizer_to_only_train_selected(
         if hasattr(optimizer, "add_param_group"):
             params = [p for p in extra_trainable_module.parameters() if p.requires_grad]
             if params:
-                optimizer.add_param_group({"params": params, "weight_decay": 0.0})
+                # Use higher learning rate for decoder-only training (5x-10x default LR)
+                # Get base LR from existing param groups
+                base_lr = optimizer.param_groups[0].get("lr", 1e-5) if optimizer.param_groups else 1e-5
+                #decoder_lr = base_lr * 5.0  # 5x higher LR for decoder
+                optimizer.add_param_group({
+                    "params": params, 
+                    "weight_decay": 0.0,
+                    "lr": base_lr
+                })
+                log_rank_0(f"Added MS-ILLM decoder to optimizer with LR={base_lr} (base LR={base_lr})")
         return out
 
     # type: ignore[method-assign]
@@ -253,7 +263,12 @@ def get_msillm_identifier(cfg: DictConfig) -> str:
     # Sanitize for filename: replace special chars
     repo_name = repo_name.replace("/", "_").replace(":", "_")
     entrypoint = entrypoint.replace("/", "_").replace(":", "_")
-    return f"msillm-{repo_name}-{entrypoint}"
+    
+    # Add gripper compression status to identifier to distinguish save directories
+    compress_gripper = msillm_cfg.get("compress_gripper", True)
+    gripper_suffix = "" if compress_gripper else "_static_only"
+    
+    return f"msillm-{repo_name}-{entrypoint}{gripper_suffix}"
 
 def extract_msillm_identifier_from_checkpoint_path(checkpoint_path: Path) -> Optional[str]:
     """
@@ -470,10 +485,14 @@ def _clip_mean_std(device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tens
     std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device, dtype=dtype).view(1, 1, 3, 1, 1)
     return mean, std
 
-def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule) -> Optional[torch.nn.Module]:
+def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress_gripper: bool = True) -> Optional[torch.nn.Module]:
     """
     Patch `MoDEAgent.embed_visual_obs` at runtime to:
       normalized -> unnormalize to [0,1] -> encode(no_grad) -> decode(with grad) -> renormalize
+
+    Args:
+        model: LightningModule to patch
+        compress_gripper: If True, apply reconstruction to gripper image as well. If False, only static image.
 
     Returns the decoder module if patch applied, else None.
     """
@@ -490,6 +509,15 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule) -> Optio
     # Ensure encoder doesn't update internal stats; decoder may train.
     encoder.eval()
     decoder.train()
+    
+    # Ensure MS-ILLM's device_setting is "forward" to allow forward() calls
+    if hasattr(msillm, "update_tensor_devices"):
+        try:
+            msillm.update_tensor_devices("forward")
+        except Exception:
+            # If update_tensor_devices fails, try to set device_setting directly
+            if hasattr(msillm, "_device_setting"):
+                msillm._device_setting = "forward"
 
     orig = getattr(model, "embed_visual_obs", None)
     if orig is None or not callable(orig):
@@ -505,21 +533,74 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule) -> Optio
         b, t, c, h, w = x01.shape
         x01_bt = x01.reshape(b * t, c, h, w)
 
+        # MS-ILLM requires images to be divisible by 16
+        # Resize to nearest multiple of 16 if needed (112 is already 16*7, so no resize needed)
+        # 224 needs to be resized to 16's multiple (e.g., 224 -> 240 or 256)
+        factor = 64  # MS-ILLM requires 16's multiple
+        if h % factor != 0 or w % factor != 0:
+            # Resize to nearest multiple of 16
+            new_h = ((h + factor - 1) // factor) * factor
+            new_w = ((w + factor - 1) // factor) * factor
+            x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
+            resize_needed = True
+        else:
+            x01_bt_resized = x01_bt
+            resize_needed = False
+
+        # CRITICAL: Follow MS-ILLM's forward process manually (from hific.py:491-524)
+        # encoder -> hyper_analysis -> hyper_bottleneck -> hyper_synthesis -> latent_bottleneck -> decoder
+        # All steps except decoder should be no_grad to ensure only decoder trains
+        # IMPORTANT: Explicitly delete intermediate tensors to save memory (especially when compress_gripper=True)
         with torch.no_grad():
-            z = encoder(x01_bt)
-        recon = decoder(z)
-        if recon.shape != x01_bt.shape and recon.numel() == x01_bt.numel():
-            recon = recon.view_as(x01_bt)
-        recon = recon.clamp(0.0, 1.0)
+            # Step 1: Encode image to latent (same as msillm.forward line 498)
+            latent = encoder(x01_bt_resized)
+            # Delete input after encoding to free memory
+            del x01_bt_resized
+            
+            # Step 2: Hyperprior analysis (same as msillm.forward line 501)
+            hyper_latent = msillm.hyper_analysis(latent)
+            hyper_latent, _ = msillm.hyper_bottleneck(hyper_latent)
+            
+            # Step 3: Hyperprior synthesis (mean and scale) (same as msillm.forward lines 507-508)
+            means = msillm.hyper_synthesis_mean(hyper_latent)
+            scales = msillm.hyper_synthesis_scale(hyper_latent)
+            
+            # Delete hyper_latent to free memory (no longer needed after synthesis)
+            del hyper_latent
+            
+            # Step 4: Latent bottleneck (quantization) (same as msillm.forward line 509-510)
+            quantized_latents, _ = msillm.latent_bottleneck(latent, scales, means=means)
+            
+            # Delete intermediate tensors to free memory (only quantized_latent is needed)
+            del latent, means, scales
+            
+            # Step 5: Use quantized latents (same as msillm.forward line 521 for eval mode)
+            # Note: We use quantized_latents (not STE) since encoder/intermediate steps are frozen
+            quantized_latent = quantized_latents
+            del quantized_latents  # Free memory, only quantized_latent is needed
+        
+        # Step 6: Decode (WITH gradients - this is what we're training) (same as msillm.forward line 524)
+        recon_resized = decoder(quantized_latent)
+        recon_resized = recon_resized.clamp(0.0, 1.0)
+        
+        # Resize back to original size if needed
+        if resize_needed:
+            recon = F.interpolate(recon_resized, size=(h, w), mode='bilinear', align_corners=False)
+            del recon_resized  # Free memory after resizing
+        else:
+            recon = recon_resized
 
         recon = recon.reshape(b, t, c, h, w)
         out = (recon - mean) / std
         return out
 
     def _patched(self, rgb_static, rgb_gripper, latent_goal):  # type: ignore
-        # Apply MS-ILLM reconstruction to both static and gripper images so decoder gradients flow from both.
+        # Apply MS-ILLM reconstruction so decoder gradients flow.
         rgb_static = _reconstruct_normed(rgb_static)
-        rgb_gripper = _reconstruct_normed(rgb_gripper)
+        
+        # Only reconstruct gripper if configured
+        if compress_gripper:
+            rgb_gripper = _reconstruct_normed(rgb_gripper)
 
         if not did_log["v"]:
             did_log["v"] = True
@@ -527,15 +608,15 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule) -> Optio
                 runId="joint-train",
                 hypothesisId="msillm-forward",
                 location="mode/training_libero_msillm.py:patch_modeagent_embed_visual_obs_for_msillm",
-                message="Applied forward-time MS-ILLM recon to both static and gripper images (encoder no_grad, decoder grad)",
+                message=f"Applied forward-time MS-ILLM recon (static={'yes'}, gripper={'yes' if compress_gripper else 'no'})",
                 data={
                     "rgb_static_shape": list(rgb_static.shape),
                     "rgb_gripper_shape": list(rgb_gripper.shape),
-                    "gripper_compression": True,
+                    "gripper_compression": compress_gripper,
                 },
             )
 
-        # Call original embed_visual_obs (bound method) with reconstructed static and gripper images.
+        # Call original embed_visual_obs (bound method) with reconstructed static and (optionally) gripper images.
         return orig(rgb_static, rgb_gripper, latent_goal)
 
     # type: ignore[method-assign]
@@ -553,22 +634,27 @@ def attach_compression_to_datamodule(datamodule, compression_model: Optional[tor
     device = "cpu"
     if compression_cfg and "inference_device" in compression_cfg:
         device = compression_cfg.inference_device
+    
+    # Check if gripper compression is enabled
+    compress_gripper = compression_cfg.get("compress_gripper", True) if compression_cfg else True
 
     # If transforms are still configs, instantiate them so we can prepend callables.
-        datamodule.transforms = hydra.utils.instantiate(datamodule.transforms)
+    datamodule.transforms = hydra.utils.instantiate(datamodule.transforms)
 
     # Use the full compression model with forward method (same as training)
     transform = ImageCompressionTransform(compression_model=compression_model, device=device)
     for split in ("train", "val"):
         if split not in datamodule.transforms:
             continue
-        # Apply compression transform to both static and gripper images
+        # Apply compression transform to static image
         if "rgb_static" in datamodule.transforms[split]:
             datamodule.transforms[split]["rgb_static"] = [transform] + list(datamodule.transforms[split]["rgb_static"])
-        if "rgb_gripper" in datamodule.transforms[split]:
+        
+        # Apply compression transform to gripper image only if enabled
+        if compress_gripper and "rgb_gripper" in datamodule.transforms[split]:
             datamodule.transforms[split]["rgb_gripper"] = [transform] + list(datamodule.transforms[split]["rgb_gripper"])
     
-    log_rank_0("Injected image compression transform into datamodule transforms (both static and gripper images, using forward method).")
+    log_rank_0(f"Injected image compression transform into datamodule transforms (static={'yes'}, gripper={'yes' if compress_gripper else 'no'}).")
 
 
 @hydra.main(config_path="../conf", config_name="config_libero_msillm")
@@ -686,7 +772,8 @@ def train(cfg: DictConfig) -> None:
                 _patch_optimizer_to_only_train_selected(model, extra_trainable_module=compression_decoder)
 
         # Patch embed_visual_obs to route images through MS-ILLM encoder(no_grad)/decoder(grad) in forward.
-        patch_modeagent_embed_visual_obs_for_msillm(model)
+        compress_gripper = cfg.msillm.get("compress_gripper", True) if "msillm" in cfg else True
+        patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper)
 
         # region agent log
         _agent_log(

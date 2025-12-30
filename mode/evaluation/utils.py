@@ -10,6 +10,7 @@ import numpy as np
 from omegaconf import OmegaConf
 import pyhash
 import torch
+import torch.nn.functional as F
 import types
 from omegaconf import DictConfig
 from safetensors.torch import load_file
@@ -196,7 +197,7 @@ def get_default_model_and_env(train_folder, dataset_path, checkpoint, env=None, 
 
 
 def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
-    # Check if checkpoint is a Hugging Face repo ID (contains "/" and doesn't look like a file path)
+    """Load model and environment for evaluation (without MS-ILLM)."""
     checkpoint_str = str(checkpoint)
     is_hf_repo = "/" in checkpoint_str and not Path(checkpoint_str).exists() and not Path(checkpoint_str).is_absolute()
     
@@ -238,42 +239,10 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
             except:
                 pass  # Don't fail if we can't re-enable struct mode
         
-        if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
-            hydra.initialize("../../conf/datamodule/datasets")
-        
-        device = get_device(device_id)
-        cfg.datamodule.root_data_dir = dataset_path
-        data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
-        
-        if prep_dm_and_deps:
-            data_module.prepare_data()
-            data_module.setup()
-            dataloader = data_module.val_dataloader()
-            dataset = dataloader["lang"].dataset
-
-            if lang_embeddings is None:
-                # Get lang_folder only when needed, with fallback
-                lang_folder = "lang_annotations"  # Default fallback
-                try:
-                    # Try to get from eval_cfg_overwrite first
-                    if "datamodule" in eval_cfg_overwrite and "datasets" in eval_cfg_overwrite["datamodule"]:
-                        if "lang_dataset" in eval_cfg_overwrite["datamodule"]["datasets"]:
-                            if "lang_folder" in eval_cfg_overwrite["datamodule"]["datasets"]["lang_dataset"]:
-                                lang_folder = eval_cfg_overwrite["datamodule"]["datasets"]["lang_dataset"]["lang_folder"]
-                    # Otherwise try from config (but don't fail if struct mode blocks it)
-                    elif hasattr(cfg.datamodule.datasets, 'lang_dataset'):
-                        try:
-                            lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
-                        except (AttributeError, KeyError):
-                            pass  # Use default
-                except:
-                    pass  # Use default
-                
-                lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
-
-            if env is None:
-                rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
-                env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
+        # Setup data module and dependencies
+        data_module, lang_embeddings, env, device = _setup_datamodule_and_deps(
+            cfg, dataset_path, prep_dm_and_deps, lang_embeddings, env, device_id
+        )
 
         # Instantiate model (same as training)
         model_cfg = cfg.model
@@ -294,27 +263,8 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
             state_dict = load_file(ckpt_path)
             print(f"[get_default_mode_and_env] Loaded {len(state_dict)} keys from safetensors")
             
-            # Handle potential key prefixes (same as training)
-            # Note: Hugging Face checkpoints have 'model.' prefix removed during save (save_to_hf.py line 121)
-            # So 'inner_model.*' keys need to be mapped back to 'model.inner_model.*'
-            fixed_state_dict = {}
-            inner_model_keys_fixed = 0
-            for k, v in state_dict.items():
-                k2 = k
-                if k2.startswith("state_dict."):
-                    k2 = k2[len("state_dict."):]
-                if k2.startswith("model."):
-                    k2 = k2[len("model."):]
-                # Handle inner_model.* keys that need to be mapped to model.inner_model.*
-                # (because save_to_hf.py removes 'model.' prefix, so inner_model.* -> model.inner_model.*)
-                if k2.startswith("inner_model."):
-                    k2 = "model." + k2
-                    inner_model_keys_fixed += 1
-                fixed_state_dict[k2] = v
-            
-            if inner_model_keys_fixed > 0:
-                print(f"[get_default_mode_and_env] Fixed {inner_model_keys_fixed} inner_model.* keys to model.inner_model.*")
-            
+            # Fix state dict keys and load
+            fixed_state_dict = _fix_state_dict_keys(state_dict, is_hf_repo=True)
             print(f"[get_default_mode_and_env] Fixed state dict has {len(fixed_state_dict)} keys")
             print(f"[get_default_mode_and_env] Loading weights into model...")
             missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
@@ -355,21 +305,10 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
         # datasets_cfg = hydra.initialize("datamodule/datasets/vision_lang.yaml")
         # since we don't use the trainer during inference, manually set up data_module
         # cfg.datamodule.datasets = datasets_cfg
-        device = get_device(device_id)
-        cfg.datamodule.root_data_dir = dataset_path
-        data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
-        if prep_dm_and_deps:
-            data_module.prepare_data()
-            data_module.setup()
-            dataloader = data_module.val_dataloader()
-            dataset = dataloader["lang"].dataset
-
-            if lang_embeddings is None:
-                lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
-
-            if env is None:
-                rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
-                env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
+        # Setup data module and dependencies
+        data_module, lang_embeddings, env, device = _setup_datamodule_and_deps(
+            cfg, dataset_path, prep_dm_and_deps, lang_embeddings, env, device_id
+        )
 
 
         # Load model from local checkpoint
@@ -410,45 +349,8 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
             del load_cfg["ckpt_path"]
         model = hydra.utils.instantiate(load_cfg)
         
-        # Load weights from file (same as training_libero_msillm.py line 718-719)
-        print(f"Loading weights from {weight_file}")
-        if weight_file.suffix == ".safetensors":
-            state_dict = load_file(weight_file)
-            # Handle potential key prefixes
-            # Note: Hugging Face checkpoints have 'model.' prefix removed during save (save_to_hf.py line 121)
-            # So 'inner_model.*' keys need to be mapped back to 'model.inner_model.*'
-            fixed_state_dict = {}
-            inner_model_keys_fixed = 0
-            for k, v in state_dict.items():
-                k2 = k
-                if k2.startswith("state_dict."):
-                    k2 = k2[len("state_dict."):]
-                if k2.startswith("model."):
-                    k2 = k2[len("model."):]
-                # Handle inner_model.* keys that need to be mapped to model.inner_model.*
-                # (because save_to_hf.py removes 'model.' prefix, so inner_model.* -> model.inner_model.*)
-                if k2.startswith("inner_model."):
-                    k2 = "model." + k2
-                    inner_model_keys_fixed += 1
-                fixed_state_dict[k2] = v
-            
-            if inner_model_keys_fixed > 0:
-                print(f"Fixed {inner_model_keys_fixed} inner_model.* keys to model.inner_model.*")
-            missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
-            print(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
-            if missing:
-                print(f"Missing keys (not loaded): {len(missing)} keys")
-            if unexpected:
-                print(f"Unexpected keys (ignored): {len(unexpected)} keys")
-        else:
-            # .ckpt file - same as training_libero_msillm.py: load state_dict directly
-            checkpoint = torch.load(weight_file.as_posix(), map_location='cpu', weights_only=False)
-            missing, unexpected = model.load_state_dict(checkpoint['state_dict'], strict=False)
-            print(f"Loaded weights from checkpoint: {len(checkpoint['state_dict'])} keys")
-            if missing:
-                print(f"Missing keys (not loaded): {len(missing)} keys")
-            if unexpected:
-                print(f"Unexpected keys (ignored): {len(unexpected)} keys")
+        # Load weights from file
+        _load_model_weights_from_file(weight_file, model, is_hf_repo=False)
 
         print(f"Finished loading model from {checkpoint_dir}")
         model.freeze()
@@ -456,6 +358,99 @@ def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, l
         print("Successfully loaded model.")
 
         return model, env, data_module, lang_embeddings
+
+# Helper functions for model loading
+def _fix_state_dict_keys(state_dict, is_hf_repo=False):
+    """Fix state dict key prefixes for compatibility."""
+    fixed_state_dict = {}
+    inner_model_keys_fixed = 0
+    for k, v in state_dict.items():
+        k2 = k
+        if k2.startswith("state_dict."):
+            k2 = k2[len("state_dict."):]
+        if k2.startswith("model."):
+            k2 = k2[len("model."):]
+        # Handle inner_model.* keys that need to be mapped to model.inner_model.*
+        if k2.startswith("inner_model."):
+            k2 = "model." + k2
+            inner_model_keys_fixed += 1
+        fixed_state_dict[k2] = v
+    
+    if inner_model_keys_fixed > 0:
+        print(f"Fixed {inner_model_keys_fixed} inner_model.* keys to model.inner_model.*")
+    
+    return fixed_state_dict
+
+
+def _get_lang_folder(cfg, eval_cfg_overwrite):
+    """Get lang_folder from config with fallback chain."""
+    # Try from eval_cfg_overwrite first
+    if "datamodule" in eval_cfg_overwrite and "datasets" in eval_cfg_overwrite["datamodule"]:
+        if "lang_dataset" in eval_cfg_overwrite["datamodule"]["datasets"]:
+            if "lang_folder" in eval_cfg_overwrite["datamodule"]["datasets"]["lang_dataset"]:
+                return eval_cfg_overwrite["datamodule"]["datasets"]["lang_dataset"]["lang_folder"]
+    
+    # Try from config
+    try:
+        if hasattr(cfg.datamodule.datasets, 'lang_dataset'):
+            return cfg.datamodule.datasets.lang_dataset.lang_folder
+    except (AttributeError, KeyError):
+        pass
+    
+    # Default fallback
+    return "lang_annotations"
+
+
+def _setup_datamodule_and_deps(cfg, dataset_path, prep_dm_and_deps, lang_embeddings, env, device_id):
+    """Setup data module and dependencies (lang_embeddings, env)."""
+    if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+        hydra.initialize("../../conf/datamodule/datasets")
+    
+    device = get_device(device_id)
+    cfg.datamodule.root_data_dir = dataset_path
+    data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
+    
+    if prep_dm_and_deps:
+        data_module.prepare_data()
+        data_module.setup()
+        dataloader = data_module.val_dataloader()
+        dataset = dataloader["lang"].dataset
+        
+        if lang_embeddings is None:
+            lang_folder = _get_lang_folder(cfg, {})
+            lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
+        
+        if env is None:
+            rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout_lh/calvin.yaml")
+            env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
+    
+    return data_module, lang_embeddings, env, device
+
+
+def _load_model_weights_from_file(weight_file, model, is_hf_repo=False):
+    """Load model weights from file (.safetensors or .ckpt)."""
+    print(f"Loading weights from {weight_file}")
+    
+    if weight_file.suffix == ".safetensors":
+        state_dict = load_file(weight_file)
+        fixed_state_dict = _fix_state_dict_keys(state_dict, is_hf_repo)
+        missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
+        print(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
+    else:
+        # .ckpt file
+        checkpoint = torch.load(weight_file.as_posix(), map_location='cpu', weights_only=False)
+        missing, unexpected = model.load_state_dict(checkpoint.get('state_dict', checkpoint), strict=False)
+        print(f"Loaded weights from checkpoint: {len(checkpoint.get('state_dict', checkpoint))} keys")
+    
+    if missing:
+        print(f"Missing keys (not loaded): {len(missing)} keys" + (f" (first 10: {missing[:10]})" if len(missing) > 10 else ""))
+        if len(missing) > 50:
+            print(f"WARNING: Too many missing keys ({len(missing)}). Model may not be properly loaded!")
+    if unexpected:
+        print(f"Unexpected keys (ignored): {len(unexpected)} keys")
+    
+    return missing, unexpected
+
 
 # Helper functions for MS-ILLM
 def extract_compression_modules(compression_model: torch.nn.Module):
@@ -522,36 +517,37 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     b, t, c, h, w = x01.shape
     x01_bt = x01.reshape(b * t, c, h, w)
     
+    # MS-ILLM requires images to be divisible by 16
+    # Evaluation images are already 16's multiple (224=16*14, 112=16*7), so no resize needed
+    # Just use the images directly without interpolation
+    x01_bt_resized = x01_bt
+    
     # Compress/Decompress (this triggers LatentCaptureWrapper if present)
     with torch.no_grad():
-        compressed = msillm.compress(x01_bt, force_cpu=False)
-        recon = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
+        compressed = msillm.compress(x01_bt_resized, force_cpu=False)
+        recon_resized = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
+    
+    recon = recon_resized
     
     # Extract single frame: [C, H, W]
     recon_frame = recon[0] if recon.dim() == 4 else recon.squeeze(0)
     return recon_frame
 
-def patch_modeagent_embed_visual_obs_for_msillm(model):
+def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = True):
     msillm = getattr(model, "msillm_model", None)
     if msillm is None:
         return None
 
     # Check if compress and decompress methods exist
     if not hasattr(msillm, "compress") or not hasattr(msillm, "decompress"):
-        # Fallback to encoder/decoder if compress/decompress don't exist
-        encoder = getattr(msillm, "encoder", None)
-        decoder = getattr(msillm, "decoder", None)
-        if encoder is None or decoder is None:
-            return None
-        use_compress_decompress = False
-    else:
-        use_compress_decompress = True
-        # If available, put model in compression mode (moves entropy bottlenecks to CPU)
-        if hasattr(msillm, "update_tensor_devices"):
-            try:
-                msillm.update_tensor_devices("compress")
-            except Exception as e:
-                print(f"[WARNING] Failed to update tensor devices for compression: {e}")
+        return None
+    
+    # If available, put model in compression mode (moves entropy bottlenecks to CPU)
+    if hasattr(msillm, "update_tensor_devices"):
+        try:
+            msillm.update_tensor_devices("compress")
+        except Exception as e:
+            print(f"[WARNING] Failed to update tensor devices for compression: {e}")
 
     msillm.eval()
 
@@ -566,21 +562,24 @@ def patch_modeagent_embed_visual_obs_for_msillm(model):
         b, t, c, h, w = x01.shape
         x01_bt = x01.reshape(b * t, c, h, w)
 
+        # MS-ILLM requires images to be divisible by 16
+        # Evaluation images are already 16's multiple (224=16*14, 112=16*7), so no resize needed
+        # Just use the images directly without interpolation
+        x01_bt_resized = x01_bt
+
         with torch.no_grad():
-            if use_compress_decompress:
-                # Use compress/decompress (same as official MS-ILLM evaluation code)
-                # Check if compress method has been wrapped (for BPP measurement)
-                # This allows wrapper to capture latents even when called from patched function
-                compress_method = getattr(msillm, "compress", None)
-                if compress_method is not None:
-                    compressed = compress_method(x01_bt, force_cpu=False)
-                    recon = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
-                else:
-                    # Fallback if compress doesn't exist
-                    recon = x01_bt
+            # Use compress/decompress (same as official MS-ILLM evaluation code)
+            # Check if compress method has been wrapped (for BPP measurement)
+            # This allows wrapper to capture latents even when called from patched function
+            compress_method = getattr(msillm, "compress", None)
+            if compress_method is not None:
+                compressed = compress_method(x01_bt_resized, force_cpu=False)
+                recon_resized = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
             else:
-                recon = x01_bt
-        
+                # Fallback if compress doesn't exist
+                recon_resized = x01_bt_resized
+        # Resize back to original size if needed
+        recon = recon_resized
         if recon.shape != x01_bt.shape and recon.numel() == x01_bt.numel():
             recon = recon.view_as(x01_bt)
 
@@ -606,33 +605,19 @@ def patch_modeagent_embed_visual_obs_for_msillm(model):
 
     def _patched(self, rgb_static, rgb_gripper, latent_goal):
         rgb_static_recon = _reconstruct_normed(rgb_static, sensor_name="rgb_static")
-        rgb_gripper_recon = _reconstruct_normed(rgb_gripper, sensor_name="rgb_gripper")
+        
+        # Only reconstruct gripper if configured
+        if compress_gripper:
+            rgb_gripper_recon = _reconstruct_normed(rgb_gripper, sensor_name="rgb_gripper")
+        else:
+            rgb_gripper_recon = rgb_gripper
+        
         return orig(rgb_static_recon, rgb_gripper_recon, latent_goal)
 
     model.embed_visual_obs = types.MethodType(_patched, model)
     return msillm
 
-def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
-    checkpoint_str = str(checkpoint)
-    is_hf_repo = "/" in checkpoint_str and not Path(checkpoint_str).exists() and not Path(checkpoint_str).is_absolute()
-    print(f"[get_msillm_mode_and_env] checkpoint: {checkpoint_str}")
-    
-    # Load config
-    if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
-        hydra.initialize("../../conf")
-    
-    try:
-        def_cfg = hydra.compose(config_name="config_libero_msillm")
-    except:
-        train_cfg_path = Path(train_folder).expanduser() / ".hydra/config.yaml"
-        if train_cfg_path.exists():
-            def_cfg = OmegaConf.load(train_cfg_path)
-        else:
-            raise FileNotFoundError(f"Could not find config. Tried config_libero_msillm.yaml and {train_cfg_path}")
-
-    cfg = OmegaConf.merge(def_cfg, OmegaConf.create(eval_cfg_overwrite))
-    
-def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
+def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}, use_ema_weights=False):
     checkpoint_str = str(checkpoint)
     is_hf_repo = "/" in checkpoint_str and not Path(checkpoint_str).exists() and not Path(checkpoint_str).is_absolute()
     print(f"[get_msillm_mode_and_env] checkpoint: {checkpoint_str}")
@@ -725,23 +710,45 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
         model.load_state_dict(state_dict, strict=False)
     else:
         sd = torch.load(weight_file, map_location='cpu', weights_only=False)
-        # Try EMA weights first
-        if "callbacks" in sd and "EMA" in sd["callbacks"] and "ema_weights" in sd["callbacks"]["EMA"]:
-            #ema_weights_list = sd["callbacks"]["EMA"]["ema_weights"]
-            #model_state_dict = model.state_dict()
-            #ema_weights_dict = {name: ema_weights_list[i] for i, (name, _) in enumerate(model_state_dict.items()) if i < len(ema_weights_list)}
-            # if ema_weights_dict:
-            #     model.load_state_dict(ema_weights_dict, strict=False)
-            #     print("Successfully loaded EMA weights from checkpoint!")
-            # else:
-            model.load_state_dict(sd.get("state_dict", sd), strict=False)
-            print("Loaded regular weights (EMA weights not found)")
+        # Try EMA weights if requested and available
+        if use_ema_weights and "callbacks" in sd and "EMA" in sd["callbacks"] and "ema_weights" in sd["callbacks"]["EMA"]:
+            ema_weights_list = sd["callbacks"]["EMA"]["ema_weights"]
+            model_state_dict = model.state_dict()
+            # Create EMA weights dict matching model's parameter names
+            # EMA weights list order matches the order of model.state_dict().values()
+            ema_weights_dict = {}
+            param_names = list(model_state_dict.keys())
+            param_values = list(model_state_dict.values())
+            for i, (name, param) in enumerate(zip(param_names, param_values)):
+                if i < len(ema_weights_list):
+                    # Ensure shape matches
+                    if ema_weights_list[i].shape == param.shape:
+                        ema_weights_dict[name] = ema_weights_list[i]
+                    else:
+                        print(f"Warning: EMA weight shape mismatch for {name}: expected {param.shape}, got {ema_weights_list[i].shape}")
+            
+            if ema_weights_dict:
+                missing, unexpected = model.load_state_dict(ema_weights_dict, strict=False)
+                print(f"Successfully loaded EMA weights from checkpoint!")
+                if missing:
+                    print(f"  Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
+                if unexpected:
+                    print(f"  Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
+            else:
+                print("Warning: EMA weights found but could not map to model parameters, falling back to regular weights")
+                model.load_state_dict(sd.get("state_dict", sd), strict=False)
         else:
             model.load_state_dict(sd.get("state_dict", sd), strict=False)
-            print("Loaded regular weights")
+            if use_ema_weights:
+                print("Warning: use_ema_weights=True but EMA weights not found in checkpoint, using regular weights")
+            else:
+                print("Loaded regular weights")
     
     # Patch MS-ILLM and move to device
-    patch_modeagent_embed_visual_obs_for_msillm(model)
+    # Get compress_gripper setting from config (default to True for backward compatibility)
+    compress_gripper = OmegaConf.select(cfg, "msillm.compress_gripper", default=True)
+    patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper)
+    print(f"[MS-ILLM] compress_gripper={compress_gripper}")
     model.freeze()
     model = move_model_to_device(model, device)
     

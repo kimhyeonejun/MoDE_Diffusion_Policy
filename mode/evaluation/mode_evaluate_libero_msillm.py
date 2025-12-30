@@ -44,6 +44,52 @@ from libero.lifelong.utils import get_task_embs
 log_print = logging.getLogger(__name__)
 
 
+def _get_bpp_wrapper(model):
+    """Helper to get BPP wrapper from model."""
+    wrapper = getattr(model, "_bpp_wrapper", None)
+    if wrapper is None:
+        msillm_model = getattr(model, "msillm_model", None)
+        if msillm_model is not None:
+            if hasattr(msillm_model, "compress") and isinstance(msillm_model.compress, LatentCaptureWrapper):
+                wrapper = msillm_model.compress
+    return wrapper
+
+
+def _calculate_bpp_from_latents(bpp_wrapper, data, sensors):
+    """Calculate BPP from captured latents."""
+    if bpp_wrapper is None or len(bpp_wrapper.latents) == 0:
+        return {}
+    
+    bpp_dict = {}
+    latents = bpp_wrapper.latents[-len(sensors):]
+    for sensor_name, latent in zip(sensors, latents):
+        img = data["rgb_obs"][sensor_name].squeeze(0)  # (C, H, W)
+        try:
+            if hasattr(latent, "latent_strings"):
+                bpp = calculate_bpp_from_hyperprior_output(latent, img.shape)
+            else:
+                bpp = calculate_bpp_from_encoder_output(latent, img, bits_per_element=8)
+            bpp_dict[sensor_name] = bpp
+        except Exception as e:
+            log_print.warning(f"Failed to calculate BPP for {sensor_name}: {e}")
+    return bpp_dict
+
+
+def _prepare_video_frame(model, obs, store_reconstructed):
+    """Prepare video frame from model or observation."""
+    if store_reconstructed and hasattr(model, '_last_reconstructed_frame_tensor'):
+        recon_frame = model._last_reconstructed_frame_tensor
+        rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
+        return rgb_recon_np[..., ::-1]  # RGB to BGR
+    else:
+        frame = obs['agentview_image']
+        if isinstance(frame, np.ndarray):
+            frame = np.rot90(frame, k=2, axes=(0, 1))
+            frame = frame[..., ::-1]
+        return frame
+
+
 class LatentCaptureWrapper:
     """Simple wrapper to capture latents for BPP calculation."""
     def __init__(self, original_method):
@@ -138,12 +184,11 @@ class EvaluateLibero:
         # Now create cfg and task embeddings with descriptions available
         self.create_cfg_for_libero(self.task_embedding_format)
         
-        # Use task embeddings created in create_cfg_for_libero
-        if hasattr(self, 'task_embs'):
-            self.benchmark_instance.set_task_embs(self.task_embs)
-        else:
+        # Set task embeddings
+        task_embs = getattr(self, 'task_embs', None)
+        if task_embs is None:
             task_embs = get_task_embs(self.cfg, self.descriptions)
-            self.benchmark_instance.set_task_embs(task_embs)
+        self.benchmark_instance.set_task_embs(task_embs)
 
         self.all_tasks = list(range(self.benchmark_instance.n_tasks))
 
@@ -242,23 +287,11 @@ class EvaluateLibero:
         return successes
 
     def evaluate_task(self, model, task_i, task_emb, task_str, idx, sim_states=None, store_video=0):
-        # Get wrapped compression method for BPP measurement
-        # First try to get from model._bpp_wrapper (set in main)
-        compress_method = getattr(model, "_bpp_wrapper", None)
-        
-        # Fallback: try to find wrapper from msillm_model directly
-        if compress_method is None:
-            msillm_model = getattr(model, "msillm_model", None)
-            if msillm_model is not None:
-                if hasattr(msillm_model, "compress") and isinstance(msillm_model.compress, LatentCaptureWrapper):
-                    compress_method = msillm_model.compress
-                elif hasattr(msillm_model, "encoder") and hasattr(msillm_model.encoder, "forward") and isinstance(msillm_model.encoder.forward, LatentCaptureWrapper):
-                    compress_method = msillm_model.encoder.forward
-        
-        if compress_method is None:
-            log_print.warning(f"[BPP] No compress_method wrapper found for task {task_str} - BPP will not be measured")
+        bpp_wrapper = _get_bpp_wrapper(model)
+        if bpp_wrapper is None:
+            log_print.warning(f"[BPP] No BPP wrapper found for task {task_str} - BPP will not be measured")
         else:
-            log_print.info(f"[BPP] Found compress_method wrapper for task {task_str}")
+            log_print.info(f"[BPP] Found BPP wrapper for task {task_str}")
         
         env_args = {
             "bddl_file_name": os.path.join(
@@ -324,83 +357,40 @@ class EvaluateLibero:
                 data, goal = self.process_env_obs(obs, task_emb, task_i.language)
                 
                 # Clear captured latents for this step
-                if compress_method is not None:
-                    compress_method.clear()
+                if bpp_wrapper is not None:
+                    bpp_wrapper.clear()
                 
                 # Store flag for video saving before model.step
-                save_frame_this_step = store_video_this_rollout and hasattr(model, '_store_reconstructed_frame')
-                if save_frame_this_step:
+                if store_video_this_rollout and hasattr(model, '_store_reconstructed_frame'):
                     model._save_frame_this_step = True
                 
                 actions = model.step(data, goal)
                 
                 # Fix for stuttering video: if model.step() didn't run inference (action chunking),
-                # manually reconstruct frame for smooth video. This ensures every step has a fresh frame.
+                # manually reconstruct frame for smooth video.
                 if (store_video_this_rollout 
                     and hasattr(model, '_store_reconstructed_frame') 
                     and model._store_reconstructed_frame
-                    and hasattr(model, '_save_frame_this_step')
-                    and model._save_frame_this_step
+                    and getattr(model, '_save_frame_this_step', False)
                     and "rgb_static" in data["rgb_obs"]):
                     recon_frame = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_static"])
                     if recon_frame is not None:
                         model._last_reconstructed_frame_tensor = recon_frame
                     model._save_frame_this_step = False
 
-                # Calculate BPP from captured latents (rgb_static + rgb_gripper)
-                # Get compress_method wrapper if available
-                bpp_compress_method = getattr(model, "_bpp_wrapper", None)
-                if bpp_compress_method is None:
-                    msillm_model = getattr(model, "msillm_model", None)
-                    if msillm_model is not None:
-                        if hasattr(msillm_model, "compress") and isinstance(msillm_model.compress, LatentCaptureWrapper):
-                            bpp_compress_method = msillm_model.compress
-                        elif hasattr(msillm_model, "encoder") and hasattr(msillm_model.encoder, "forward") and isinstance(msillm_model.encoder.forward, LatentCaptureWrapper):
-                            bpp_compress_method = msillm_model.encoder.forward
-                
-                if bpp_compress_method is not None and len(bpp_compress_method.latents) > 0:
-                    bpp_dict = {}
-                    sensors = [k for k in ("rgb_static", "rgb_gripper") if k in data.get("rgb_obs", {})]
-                    # Map most recent latents to sensors in call order
-                    latents = bpp_compress_method.latents[-len(sensors):]
-                    for sensor_name, latent in zip(sensors, latents):
-                        img = data["rgb_obs"][sensor_name]  # (1, C, H, W)
-                        img_for_bpp = img.squeeze(0)  # (C, H, W)
-                        try:
-                            if hasattr(latent, "latent_strings"):
-                                bpp = calculate_bpp_from_hyperprior_output(latent, img_for_bpp.shape)
-                            else:
-                                bpp = calculate_bpp_from_encoder_output(latent, img_for_bpp, bits_per_element=8)
-                            bpp_dict[sensor_name] = bpp
-                        except Exception as e:
-                            log_print.warning(f"Failed to calculate BPP for {sensor_name}: {e}")
-                    # Accumulate BPP statistics
-                    if bpp_dict:
-                        self.bpp_stats = accumulate_bpp_stats(bpp_dict, self.bpp_stats)
+                # Calculate BPP from captured latents
+                sensors = [k for k in ("rgb_static", "rgb_gripper") if k in data.get("rgb_obs", {})]
+                bpp_dict = _calculate_bpp_from_latents(bpp_wrapper, data, sensors)
+                if bpp_dict:
+                    self.bpp_stats = accumulate_bpp_stats(bpp_dict, self.bpp_stats)
                 
                 actions = actions.cpu().numpy()
                 obs, reward, done, info = env.step(actions)
 
                 if store_video_this_rollout:
-                    # Use reconstructed image if flag is set, otherwise use original (which is already numpy)
-                    if (hasattr(model, '_store_reconstructed_frame') and 
-                        model._store_reconstructed_frame and 
-                        hasattr(model, '_last_reconstructed_frame_tensor')):
-                        # Only convert GPU tensor to numpy when using reconstructed frames
-                        # Note: This GPU->CPU transfer is necessary because:
-                        # 1. PyTorch GPU tensors cannot be directly converted to numpy
-                        # 2. cv2.VideoWriter only accepts numpy arrays
-                        recon_frame = model._last_reconstructed_frame_tensor  # [C, H, W] tensor on GPU
-                        rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                        rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))  # Rotate 180 degrees
-                        frame = rgb_recon_np[..., ::-1]  # RGB to BGR for cv2
-                    else:
-                        # Use original frame (already numpy, no GPU->CPU transfer needed)
-                        frame = obs['agentview_image']
-                        # Fix: Rotate 180 degrees and convert RGB to BGR for cv2
-                        if isinstance(frame, np.ndarray):
-                            frame = np.rot90(frame, k=2, axes=(0, 1))
-                            frame = frame[..., ::-1]
+                    store_reconstructed = (hasattr(model, '_store_reconstructed_frame') 
+                                         and model._store_reconstructed_frame)
+                    frame = _prepare_video_frame(model, obs, store_reconstructed)
                     video_frames.append(frame)
 
                 if done:
@@ -504,63 +494,171 @@ def _instantiate_transforms(transforms_cfg):
             transforms[key] = [hydra.utils.instantiate(t_cfg)]
     return transforms
 
-@hydra.main(config_path="../../conf", config_name="mode_evaluate_libero_msillm")
-def main(cfg: DictConfig):
-    seed_everything(0, workers=True)
+
+def _load_transforms(loaded_cfg, dm, cfg):
+    """Load transforms with fallback chain."""
+    try:
+        # Try from loaded config first
+        if hasattr(loaded_cfg, 'datamodule') and hasattr(loaded_cfg.datamodule, 'transforms'):
+            transforms_cfg = loaded_cfg.datamodule.transforms.get("val", loaded_cfg.datamodule.transforms)
+        # Fallback to DM transforms
+        elif hasattr(dm, 'transforms') and dm.transforms is not None:
+            transforms_cfg = dm.transforms.get('val', dm.transforms) if isinstance(dm.transforms, dict) else dm.transforms
+        # Final fallback to current cfg
+        else:
+            transforms_cfg = cfg.datamodule.transforms.get("val", cfg.datamodule.transforms)
+        
+        return _instantiate_transforms(transforms_cfg)
+    except Exception as e:
+        print(f"[WARNING] Failed to load transforms: {e}")
+        if hasattr(dm, 'transforms'):
+            return dm.transforms
+        raise
+
+
+def _get_device_config(cfg):
+    """Get device ID and device string from config."""
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible:
+        return 0, "cuda:0"
     
-    # Handle checkpoint path from environment variable if provided
+    device_id = getattr(cfg, 'device', 0)
+    device_str = device_id if isinstance(device_id, str) else f"cuda:{device_id}"
+    return device_id, device_str
+
+
+def _setup_msillm_features(model, cfg):
+    """Setup MS-ILLM BPP measurement wrapper and video settings."""
+    # Wrap MS-ILLM compression method for BPP measurement
+    msillm_model = getattr(model, "msillm_model", None)
+    wrapper = None
+    if msillm_model is not None and hasattr(msillm_model, "compress"):
+        wrapper = LatentCaptureWrapper(msillm_model.compress)
+        msillm_model.compress = wrapper
+        print(f"[BPP] Wrapped msillm_model.compress for BPP measurement")
+    
+    if wrapper is not None:
+        model._bpp_wrapper = wrapper
+        print(f"[BPP] Stored wrapper on model._bpp_wrapper")
+    else:
+        print(f"[BPP] WARNING: No wrapper created - BPP measurement may not work")
+    
+    # Enable storing reconstructed frames for video
+    use_reconstructed = getattr(cfg, 'use_reconstructed_video', True)
+    has_msillm = hasattr(model, 'msillm_model') and model.msillm_model is not None
+    
+    if has_msillm and use_reconstructed:
+        model._store_reconstructed_frame = True
+        print("[Video] Will save MS-ILLM reconstructed images to video")
+    else:
+        model._store_reconstructed_frame = False
+        if has_msillm:
+            print("[Video] Will save original env images to video (use_reconstructed_video=False)")
+        else:
+            print("[Video] Will save original env images to video (no MS-ILLM model)")
+
+
+def _resolve_checkpoint_path(cfg):
+    """Resolve checkpoint path from env var or config."""
     checkpoint_env = os.environ.get("CHECKPOINT_PATH")
     if checkpoint_env:
         print(f"Using checkpoint from environment variable: {checkpoint_env}")
         cfg.checkpoint = checkpoint_env
+        return
     
-    # If checkpoint is not specified (null/empty), use pretrain_chk from config_libero_msillm.yaml (Hugging Face repo)
+    # If checkpoint is not specified, use pretrain_chk from config
     if not cfg.checkpoint or cfg.checkpoint in ("", "null", None):
-        # Load config_libero_msillm to get pretrain_chk
         try:
             if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
                 hydra.initialize("../../conf")
             base_cfg = hydra.compose(config_name="config_libero_msillm")
             if hasattr(base_cfg, "pretrain_chk") and base_cfg.pretrain_chk:
                 cfg.checkpoint = base_cfg.pretrain_chk
-                print(f"No checkpoint specified, using pretrained checkpoint from config_libero_msillm.yaml: {cfg.checkpoint}")
+                print(f"No checkpoint specified, using pretrained checkpoint: {cfg.checkpoint}")
             else:
-                raise ValueError("No checkpoint specified and pretrain_chk not found in config_libero_msillm.yaml")
+                raise ValueError("No checkpoint specified and pretrain_chk not found in config")
         except Exception as e:
             print(f"Error: Could not load pretrain_chk from config: {e}")
-            raise ValueError("No checkpoint specified. Please provide checkpoint path or ensure pretrain_chk is set in config_libero_msillm.yaml")
+            raise ValueError("No checkpoint specified. Please provide checkpoint path or ensure pretrain_chk is set in config")
+
+
+def _sanitize_checkpoint_path(cfg):
+    """Sanitize checkpoint filename to avoid Hydra parsing issues."""
+    if not cfg.checkpoint or "=" not in cfg.checkpoint:
+        return
+    if Path(cfg.checkpoint).is_absolute() or "/" in cfg.checkpoint:
+        return  # Skip for absolute paths or Hugging Face repo IDs
     
-    # Sanitize checkpoint filename: replace '=' with '-' to avoid Hydra parsing issues
-    # (Only if checkpoint is not a Hugging Face repo ID)
-    if cfg.checkpoint and "=" in cfg.checkpoint and not Path(cfg.checkpoint).is_absolute() and "/" not in cfg.checkpoint:
-        sanitized_checkpoint = cfg.checkpoint.replace("=", "-")
-        checkpoint_path = Path(cfg.train_folder) / cfg.checkpoint
-        sanitized_path = Path(cfg.train_folder) / sanitized_checkpoint
-        
-        if sanitized_path.exists():
-            print(f"Using sanitized checkpoint path: {sanitized_checkpoint}")
-            cfg.checkpoint = sanitized_checkpoint
-        elif checkpoint_path.exists():
-            print(f"Warning: Checkpoint filename contains '=' which may cause Hydra parsing issues.")
-            print(f"Consider renaming: {checkpoint_path} -> {sanitized_path}")
-        else:
-            print(f"Warning: Checkpoint not found: {checkpoint_path}")
+    sanitized_checkpoint = cfg.checkpoint.replace("=", "-")
+    checkpoint_path = Path(cfg.train_folder) / cfg.checkpoint
+    sanitized_path = Path(cfg.train_folder) / sanitized_checkpoint
     
-    # Handle CUDA_VISIBLE_DEVICES properly for torch device selection
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible:
-        device_id = 0
-        device_str = "cuda:0"
+    if sanitized_path.exists():
+        print(f"Using sanitized checkpoint path: {sanitized_checkpoint}")
+        cfg.checkpoint = sanitized_checkpoint
+    elif checkpoint_path.exists():
+        print(f"Warning: Checkpoint filename contains '=' which may cause Hydra parsing issues.")
+        print(f"Consider renaming: {checkpoint_path} -> {sanitized_path}")
     else:
-        device_id = getattr(cfg, 'device', 0)
-        if isinstance(device_id, str):
-            device_str = device_id
-        else:
-            device_str = f"cuda:{device_id}"
+        print(f"Warning: Checkpoint not found: {checkpoint_path}")
+
+
+def _setup_wandb(cfg, log_dir):
+    """Setup wandb logger."""
+    import hashlib
+    os.makedirs(log_dir / "wandb", exist_ok=True)
+    checkpoint_stem = Path(cfg.checkpoint).stem
     
-    print(f"Using device: {device_str} (CUDA_VISIBLE_DEVICES={cuda_visible})")
+    # Get wandb config with fallbacks
+    project = OmegaConf.select(cfg, "logger.project", default="mode_libero_eval")
+    group = OmegaConf.select(cfg, "logger.group", default="mode_libero_eval")
+    mode = OmegaConf.select(cfg, "logger.mode", default="online")
+    run_id = OmegaConf.select(cfg, "logger.id", default=None)
+    entity = OmegaConf.select(cfg, "logger.entity", default=None) or cfg.get("wandb_entity", None)
+    
+    # Clean up None/empty values
+    entity = None if entity in ("null", "", None) else entity
+    run_id = None if run_id in ("null", "") else run_id
+    
+    # Generate unique run_id if not provided
+    if run_id is None:
+        unique_str = f"{checkpoint_stem}_{time.time()}"
+        run_id = hashlib.md5(unique_str.encode()).hexdigest()[:16]
+    
+    wandb.init(
+        project=project,
+        entity=entity,
+        name=checkpoint_stem,
+        group=group,
+        config={
+            "checkpoint": cfg.checkpoint,
+            "benchmark_name": cfg.benchmark_name,
+            "num_sequences": cfg.num_sequences,
+            "n_eval": cfg.n_eval,
+            "max_steps": cfg.max_steps,
+        },
+        dir=str(log_dir / "wandb"),
+        mode=mode,
+        id=run_id,
+        resume="allow",
+    )
+
+@hydra.main(config_path="../../conf", config_name="mode_evaluate_libero_msillm")
+def main(cfg: DictConfig):
+    seed_everything(0, workers=True)
+    
+    # Handle checkpoint path
+    _resolve_checkpoint_path(cfg)
+    
+    # Sanitize checkpoint filename if needed
+    _sanitize_checkpoint_path(cfg)
+    
+    # Handle device selection
+    device_id, device_str = _get_device_config(cfg)
+    print(f"Using device: {device_str} (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})")
     
     # Load model using utility function (handles MS-ILLM automatically)
+    use_ema = getattr(cfg, 'use_ema_weights', False)
     model, _, dm, _, loaded_cfg = get_msillm_mode_and_env(
         cfg.train_folder,
         cfg.dataset_path,
@@ -569,49 +667,12 @@ def main(cfg: DictConfig):
         lang_embeddings=None,
         eval_cfg_overwrite=cfg.eval_cfg_overwrite if hasattr(cfg, 'eval_cfg_overwrite') else {},
         device_id=device_id,
-        prep_dm_and_deps=False
+        prep_dm_and_deps=False,
+        use_ema_weights=use_ema
     )
     
-    # Wrap MS-ILLM compression method for BPP measurement
-    # This captures latents during forward pass for BPP calculation
-    # NOTE: We wrap AFTER get_msillm_mode_and_env because patch happens inside it
-    # But wrapper will still work because utils.py uses getattr(msillm, "compress") for dynamic lookup
-    msillm_model = getattr(model, "msillm_model", None)
-    wrapper = None
-    if msillm_model is not None:
-        if hasattr(msillm_model, "compress"):
-            # Store original compress method
-            original_compress = msillm_model.compress
-            # Wrap it
-            wrapper = LatentCaptureWrapper(original_compress)
-            msillm_model.compress = wrapper
-            print(f"[BPP] Wrapped msillm_model.compress for BPP measurement")
-        elif hasattr(msillm_model.encoder, "forward"):
-            # Store original encoder forward method
-            original_encoder_forward = msillm_model.encoder.forward
-            # Wrap it
-            wrapper = LatentCaptureWrapper(original_encoder_forward)
-            msillm_model.encoder.forward = wrapper
-            print(f"[BPP] Wrapped msillm_model.encoder.forward for BPP measurement")
-    
-    # Store wrapper on model object for easy access in evaluate_task
-    if wrapper is not None:
-        model._bpp_wrapper = wrapper
-        print(f"[BPP] Stored wrapper on model._bpp_wrapper")
-    else:
-        print(f"[BPP] WARNING: No wrapper created - BPP measurement may not work")
-    
-    # Enable storing reconstructed frames for video (if MS-ILLM is used and config allows it)
-    use_reconstructed = getattr(cfg, 'use_reconstructed_video', True)  # Default to True for backward compatibility
-    if hasattr(model, 'msillm_model') and model.msillm_model is not None and use_reconstructed:
-        model._store_reconstructed_frame = True
-        print("[Video] Will save MS-ILLM reconstructed images to video")
-    else:
-        model._store_reconstructed_frame = False
-        if hasattr(model, 'msillm_model') and model.msillm_model is not None:
-            print("[Video] Will save original env images to video (use_reconstructed_video=False)")
-        else:
-            print("[Video] Will save original env images to video (no MS-ILLM model)")
+    # Setup MS-ILLM BPP measurement and video settings
+    _setup_msillm_features(model, cfg)
     
     # Ensure DataModule is setup to load statistics
     if not hasattr(dm, 'train_datasets') or not dm.train_datasets:
@@ -623,36 +684,7 @@ def main(cfg: DictConfig):
     log_dir = get_log_dir(cfg.log_dir, checkpoint_name=cfg.checkpoint)
     
     # Load transforms (prefer validation transforms if available)
-    transforms = {}
-    try:
-        transforms_cfg = None
-        # Try from loaded config first
-        if hasattr(loaded_cfg, 'datamodule') and hasattr(loaded_cfg.datamodule, 'transforms'):
-             transforms_cfg = loaded_cfg.datamodule.transforms.val if "val" in loaded_cfg.datamodule.transforms else loaded_cfg.datamodule.transforms
-        
-        # Fallback to DM transforms if config lookup failed
-        if transforms_cfg is None and hasattr(dm, 'transforms') and dm.transforms is not None:
-            if 'val' in dm.transforms:
-                transforms_cfg = dm.transforms.val
-            else:
-                transforms_cfg = dm.transforms
-        
-        # Final fallback to current cfg
-        if transforms_cfg is None:
-            transforms_cfg = cfg.datamodule.transforms.val if "val" in cfg.datamodule.transforms else cfg.datamodule.transforms
-            
-        # Instantiate transforms properly (handle ListConfig -> Compose)
-        transforms = _instantiate_transforms(transforms_cfg)
-        
-    except Exception as e:
-        print(f"[WARNING] Failed to load transforms from DM/Config: {e}")
-        import traceback
-        traceback.print_exc()
-        # Final fallback to existing DM transforms if already instantiated
-        if hasattr(dm, 'transforms'):
-             transforms = dm.transforms
-        else:
-             raise e
+    transforms = _load_transforms(loaded_cfg, dm, cfg)
 
     print(f"[INFO] Loaded transforms: {transforms.keys() if hasattr(transforms, 'keys') else transforms}")
 
@@ -671,48 +703,7 @@ def main(cfg: DictConfig):
 
     # Setup wandb logger
     if cfg.log_wandb:
-        os.makedirs(log_dir / "wandb", exist_ok=True)
-        checkpoint_stem = Path(cfg.checkpoint).stem
-        wandb_config = {
-            "checkpoint": cfg.checkpoint,
-            "benchmark_name": cfg.benchmark_name,
-            "num_sequences": cfg.num_sequences,
-            "n_eval": cfg.n_eval,
-            "max_steps": cfg.max_steps,
-        }
-
-        project = OmegaConf.select(cfg, "logger.project", default=None) or "mode_libero_eval"
-        group = OmegaConf.select(cfg, "logger.group", default=None) or "mode_libero_eval"
-        mode = OmegaConf.select(cfg, "logger.mode", default=None) or "online"
-        run_id = OmegaConf.select(cfg, "logger.id", default=None)
-        entity = OmegaConf.select(cfg, "logger.entity", default=None)
-        if entity in ("null", "", None):
-            # legacy key
-            entity = cfg.get("wandb_entity", None)
-            if entity in ("null", ""):
-                entity = None
-        if run_id in ("null", ""):
-            run_id = None
-        
-        # Generate unique run_id if not provided to avoid HTTP 409 conflicts
-        if run_id is None:
-            import time
-            import hashlib
-            # Create unique run_id based on checkpoint name and timestamp
-            unique_str = f"{checkpoint_stem}_{time.time()}"
-            run_id = hashlib.md5(unique_str.encode()).hexdigest()[:16]
-
-        run = wandb.init(
-            project=project,
-            entity=entity,
-            name=checkpoint_stem,
-            group=group,
-            config=wandb_config,
-            dir=str(log_dir / "wandb"),
-            mode=mode,
-            id=run_id,
-            resume="allow",  # Allow resuming if run_id exists (though unlikely with unique IDs)
-        )
+        _setup_wandb(cfg, log_dir)
 
     eval_libero.setup()
     eval_libero.start()

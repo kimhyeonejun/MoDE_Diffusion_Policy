@@ -50,6 +50,7 @@ msillm:
   hub_repo: facebookresearch/NeuralCompression:main  # Changed from v0.3.1 to main for msillm_quality_vlo1
   entrypoint: msillm_quality_vlo2
   pretrained: true
+  compress_gripper: true # Whether to compress gripper image or not
 
 # Training configuration: which modules to train/freeze
 # Set to True to train, False to freeze
