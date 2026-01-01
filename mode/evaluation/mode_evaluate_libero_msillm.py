@@ -75,19 +75,36 @@ def _calculate_bpp_from_latents(bpp_wrapper, data, sensors):
     return bpp_dict
 
 
-def _prepare_video_frame(model, obs, store_reconstructed):
-    """Prepare video frame from model or observation."""
-    if store_reconstructed and hasattr(model, '_last_reconstructed_frame_tensor'):
-        recon_frame = model._last_reconstructed_frame_tensor
-        rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
-        return rgb_recon_np[..., ::-1]  # RGB to BGR
-    else:
+def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_static'):
+    """Prepare video frame from model or observation.
+    
+    Args:
+        model: Model with reconstructed frame tensors
+        obs: Environment observation dictionary
+        store_reconstructed: Whether to use reconstructed frames
+        sensor_name: 'rgb_static' or 'rgb_gripper'
+    """
+    if store_reconstructed:
+        # Check for sensor-specific reconstructed frame
+        tensor_attr = f'_last_reconstructed_frame_tensor_{sensor_name}'
+        if hasattr(model, tensor_attr):
+            recon_frame = getattr(model, tensor_attr)
+            rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
+            return rgb_recon_np[..., ::-1]  # RGB to BGR
+    
+    # Use original observation
+    if sensor_name == 'rgb_static':
         frame = obs['agentview_image']
-        if isinstance(frame, np.ndarray):
-            frame = np.rot90(frame, k=2, axes=(0, 1))
-            frame = frame[..., ::-1]
-        return frame
+    elif sensor_name == 'rgb_gripper':
+        frame = obs['robot0_eye_in_hand_image']
+    else:
+        raise ValueError(f"Unknown sensor_name: {sensor_name}")
+    
+    if isinstance(frame, np.ndarray):
+        frame = np.rot90(frame, k=2, axes=(0, 1))
+        frame = frame[..., ::-1]
+    return frame
 
 
 class LatentCaptureWrapper:
@@ -325,11 +342,15 @@ class EvaluateLibero:
         for i in pbar:
             store_video_this_rollout = i < store_video
             if store_video_this_rollout:
-                video_frames = []
-                video_filename = f"rollout_{task_str}_nmp_{i}.mp4"
-                video_path = os.path.join(self.log_dir, video_filename)
+                video_frames_static = []
+                video_frames_gripper = []
+                video_filename_static = f"rollout_{task_str}_static_nmp_{i}.mp4"
+                video_filename_gripper = f"rollout_{task_str}_gripper_nmp_{i}.mp4"
+                video_path_static = os.path.join(self.log_dir, video_filename_static)
+                video_path_gripper = os.path.join(self.log_dir, video_filename_gripper)
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
-                video_writer = cv2.VideoWriter(video_path, fourcc, 20.0, (self.img_w, self.img_h))
+                video_writer_static = cv2.VideoWriter(video_path_static, fourcc, 20.0, (self.img_w, self.img_h))
+                video_writer_gripper = cv2.VideoWriter(video_path_gripper, fourcc, 20.0, (self.img_w, self.img_h))
 
             env.reset()
 
@@ -360,23 +381,23 @@ class EvaluateLibero:
                 if bpp_wrapper is not None:
                     bpp_wrapper.clear()
                 
-                # Store flag for video saving before model.step
-                if store_video_this_rollout and hasattr(model, '_store_reconstructed_frame'):
-                    model._save_frame_this_step = True
-                
                 actions = model.step(data, goal)
                 
                 # Fix for stuttering video: if model.step() didn't run inference (action chunking),
                 # manually reconstruct frame for smooth video.
                 if (store_video_this_rollout 
                     and hasattr(model, '_store_reconstructed_frame') 
-                    and model._store_reconstructed_frame
-                    and getattr(model, '_save_frame_this_step', False)
-                    and "rgb_static" in data["rgb_obs"]):
-                    recon_frame = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_static"])
-                    if recon_frame is not None:
-                        model._last_reconstructed_frame_tensor = recon_frame
-                    model._save_frame_this_step = False
+                    and model._store_reconstructed_frame):
+                    # Reconstruct rgb_static if available
+                    if "rgb_static" in data["rgb_obs"]:
+                        recon_frame = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_static"])
+                        if recon_frame is not None:
+                            model._last_reconstructed_frame_tensor_rgb_static = recon_frame
+                    # Reconstruct rgb_gripper if available
+                    if "rgb_gripper" in data["rgb_obs"]:
+                        recon_frame_gripper = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_gripper"])
+                        if recon_frame_gripper is not None:
+                            model._last_reconstructed_frame_tensor_rgb_gripper = recon_frame_gripper
 
                 # Calculate BPP from captured latents
                 sensors = [k for k in ("rgb_static", "rgb_gripper") if k in data.get("rgb_obs", {})]
@@ -390,16 +411,25 @@ class EvaluateLibero:
                 if store_video_this_rollout:
                     store_reconstructed = (hasattr(model, '_store_reconstructed_frame') 
                                          and model._store_reconstructed_frame)
-                    frame = _prepare_video_frame(model, obs, store_reconstructed)
-                    video_frames.append(frame)
+                    # Save static frame
+                    frame_static = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_static')
+                    video_frames_static.append(frame_static)
+                    # Save gripper frame
+                    frame_gripper = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_gripper')
+                    video_frames_gripper.append(frame_gripper)
 
                 if done:
                     break
 
             if store_video_this_rollout:
-                for frame in video_frames:
-                    video_writer.write(frame)
-                video_writer.release()
+                # Write static video
+                for frame in video_frames_static:
+                    video_writer_static.write(frame)
+                video_writer_static.release()
+                # Write gripper video
+                for frame in video_frames_gripper:
+                    video_writer_gripper.write(frame)
+                video_writer_gripper.release()
 
             # a new form of success record
             num_success += int(done)

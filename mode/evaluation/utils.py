@@ -585,21 +585,6 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
 
         recon = recon.reshape(b, t, c, h, w)
         
-        # Store reconstructed image tensor (still on GPU) for video conversion (only if needed this step)
-        # This avoids GPU-CPU sync when not saving video
-        if (
-            sensor_name == "rgb_static"
-            and hasattr(model, '_save_frame_this_step')
-            and model._save_frame_this_step
-            and hasattr(model, '_store_reconstructed_frame')
-            and hasattr(model, 'msillm_model')
-            and model.msillm_model is not None
-        ):
-            # Store as tensor to avoid GPU-CPU sync
-            recon_frame = recon[0, -1] if recon.dim() == 5 else recon[0]  # [C, H, W], still on GPU
-            model._last_reconstructed_frame_tensor = recon_frame  # Store tensor version
-            model._save_frame_this_step = False  # Reset flag
-        
         out = (recon - mean) / std
         return out
 
