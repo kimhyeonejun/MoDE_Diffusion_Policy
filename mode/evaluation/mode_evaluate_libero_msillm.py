@@ -321,15 +321,17 @@ class EvaluateLibero:
         # Try to handle the frame buffer issue
         env_creation = False
         count = 0
+        last_error = None
         while not env_creation and count < 5:
             try:
                 env = OffScreenRenderEnv(**env_args)
                 env_creation = True
-            except:
+            except Exception as e:
+                last_error = e
                 time.sleep(5)
                 count += 1
         if count >= 5:
-            raise Exception("Failed to create environment")
+            raise RuntimeError(f"Failed to create environment after 5 attempts: {last_error}") from last_error
 
         ### Evaluation loop
         # get fixed init states to control the experiment randomness
@@ -527,23 +529,17 @@ def _instantiate_transforms(transforms_cfg):
 
 def _load_transforms(loaded_cfg, dm, cfg):
     """Load transforms with fallback chain."""
-    try:
-        # Try from loaded config first
-        if hasattr(loaded_cfg, 'datamodule') and hasattr(loaded_cfg.datamodule, 'transforms'):
-            transforms_cfg = loaded_cfg.datamodule.transforms.get("val", loaded_cfg.datamodule.transforms)
-        # Fallback to DM transforms
-        elif hasattr(dm, 'transforms') and dm.transforms is not None:
-            transforms_cfg = dm.transforms.get('val', dm.transforms) if isinstance(dm.transforms, dict) else dm.transforms
-        # Final fallback to current cfg
-        else:
-            transforms_cfg = cfg.datamodule.transforms.get("val", cfg.datamodule.transforms)
-        
-        return _instantiate_transforms(transforms_cfg)
-    except Exception as e:
-        print(f"[WARNING] Failed to load transforms: {e}")
-        if hasattr(dm, 'transforms'):
-            return dm.transforms
-        raise
+    # Try from loaded config first
+    if hasattr(loaded_cfg, 'datamodule') and hasattr(loaded_cfg.datamodule, 'transforms'):
+        transforms_cfg = loaded_cfg.datamodule.transforms.get("val", loaded_cfg.datamodule.transforms)
+    # Fallback to DM transforms
+    elif hasattr(dm, 'transforms') and dm.transforms is not None:
+        transforms_cfg = dm.transforms.get('val', dm.transforms) if isinstance(dm.transforms, dict) else dm.transforms
+    # Final fallback to current cfg
+    else:
+        transforms_cfg = cfg.datamodule.transforms.get("val", cfg.datamodule.transforms)
+    
+    return _instantiate_transforms(transforms_cfg)
 
 
 def _get_device_config(cfg):
@@ -598,18 +594,14 @@ def _resolve_checkpoint_path(cfg):
     
     # If checkpoint is not specified, use pretrain_chk from config
     if not cfg.checkpoint or cfg.checkpoint in ("", "null", None):
-        try:
-            if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
-                hydra.initialize("../../conf")
-            base_cfg = hydra.compose(config_name="config_libero_msillm")
-            if hasattr(base_cfg, "pretrain_chk") and base_cfg.pretrain_chk:
-                cfg.checkpoint = base_cfg.pretrain_chk
-                print(f"No checkpoint specified, using pretrained checkpoint: {cfg.checkpoint}")
-            else:
-                raise ValueError("No checkpoint specified and pretrain_chk not found in config")
-        except Exception as e:
-            print(f"Error: Could not load pretrain_chk from config: {e}")
-            raise ValueError("No checkpoint specified. Please provide checkpoint path or ensure pretrain_chk is set in config")
+        if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+            hydra.initialize("../../conf")
+        base_cfg = hydra.compose(config_name="config_libero_msillm")
+        if hasattr(base_cfg, "pretrain_chk") and base_cfg.pretrain_chk:
+            cfg.checkpoint = base_cfg.pretrain_chk
+            print(f"No checkpoint specified, using pretrained checkpoint: {cfg.checkpoint}")
+        else:
+            raise ValueError("No checkpoint specified and pretrain_chk not found in config")
 
 
 def _sanitize_checkpoint_path(cfg):
@@ -711,7 +703,14 @@ def main(cfg: DictConfig):
     model.eval()
 
     # Get log directory based on checkpoint name (without extension)
-    log_dir = get_log_dir(cfg.log_dir, checkpoint_name=cfg.checkpoint)
+    # If using default pretrain_chk and MS-ILLM entrypoint is specified, use entrypoint as directory name
+    log_checkpoint_name = cfg.checkpoint
+    if cfg.checkpoint == "mbreuss/MoDE_LIBERO_10":  # Check if using default pretrain_chk
+        msillm_entrypoint = OmegaConf.select(cfg, 'eval_cfg_overwrite.msillm.entrypoint', default=None)
+        if msillm_entrypoint:
+            log_checkpoint_name = msillm_entrypoint
+            print(f"Using MS-ILLM entrypoint '{msillm_entrypoint}' for log directory")
+    log_dir = get_log_dir(cfg.log_dir, checkpoint_name=log_checkpoint_name)
     
     # Load transforms (prefer validation transforms if available)
     transforms = _load_transforms(loaded_cfg, dm, cfg)

@@ -371,15 +371,7 @@ def setup_logger(cfg: DictConfig, model: LightningModule):
             if cfg.logger.get("id") is None or cfg.logger.get("id") == "null":
                 base_id = cfg.logger.name.replace("/", "_").replace(":", "_")
                 cfg.logger.id = f"{base_id}_seed{seed}" if seed is not None else base_id
-    
-    # Set tags for wandb before instantiation (to avoid triggering wandb.init early)
-    # WandbLogger accepts tags parameter during initialization
-    # if msillm_info and cfg.logger.get("_target_", "").endswith("WandbLogger"):
-    #     existing_tags = cfg.logger.get("tags", [])
-    #     if not isinstance(existing_tags, list):
-    #         existing_tags = []
-    #     cfg.logger.tags = existing_tags + [msillm_info, "msillm-training"]
-    
+                
     logger_instance = hydra.utils.instantiate(cfg.logger)
     
     return logger_instance
@@ -403,43 +395,39 @@ def load_pretrained_weights_from_hf(model: LightningModule, repo_id: str, filena
         repo_id: Hugging Face repo ID (e.g., "mbreuss/MoDE_LIBERO_10").
         filename: Name of the safetensors file (default: "model_cleaned.safetensors").
     """
-    try:
-        ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
-        log_rank_0(f"Loading pretrained weights from Hugging Face: {repo_id}/{filename}")
-        log_rank_0(f"Checkpoint path: {ckpt_path}")
-        
-        state_dict = load_file(ckpt_path)
-        
-        # Handle potential key prefixes (e.g., "state_dict.", "model.")
-        # Note: Hugging Face checkpoints have 'model.' prefix removed during save (save_to_hf.py)
-        # So 'inner_model.*' keys need to be mapped back to 'model.inner_model.*'
-        fixed_state_dict = {}
-        inner_model_keys_fixed = 0
-        for k, v in state_dict.items():
-            k2 = k
-            if k2.startswith("state_dict."):
-                k2 = k2[len("state_dict."):]
-            if k2.startswith("model."):
-                k2 = k2[len("model."):]
-            # Handle inner_model.* keys that need to be mapped to model.inner_model.*
-            # (because save_to_hf.py removes 'model.' prefix, so inner_model.* -> model.inner_model.*)
-            if k2.startswith("inner_model."):
-                k2 = "model." + k2
-                inner_model_keys_fixed += 1
-            fixed_state_dict[k2] = v
-        
-        if inner_model_keys_fixed > 0:
-            log_rank_0(f"Fixed {inner_model_keys_fixed} inner_model.* keys to model.inner_model.*")
-        
-        missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
-        log_rank_0(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
-        if missing:
-            log_rank_0(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
-        if unexpected:
-            log_rank_0(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
-    except Exception as e:
-        log_rank_0(f"Failed to load pretrained weights from Hugging Face {repo_id}: {e}")
-        raise
+    ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
+    log_rank_0(f"Loading pretrained weights from Hugging Face: {repo_id}/{filename}")
+    log_rank_0(f"Checkpoint path: {ckpt_path}")
+    
+    state_dict = load_file(ckpt_path)
+    
+    # Handle potential key prefixes (e.g., "state_dict.", "model.")
+    # Note: Hugging Face checkpoints have 'model.' prefix removed during save (save_to_hf.py)
+    # So 'inner_model.*' keys need to be mapped back to 'model.inner_model.*'
+    fixed_state_dict = {}
+    inner_model_keys_fixed = 0
+    for k, v in state_dict.items():
+        k2 = k
+        if k2.startswith("state_dict."):
+            k2 = k2[len("state_dict."):]
+        if k2.startswith("model."):
+            k2 = k2[len("model."):]
+        # Handle inner_model.* keys that need to be mapped to model.inner_model.*
+        # (because save_to_hf.py removes 'model.' prefix, so inner_model.* -> model.inner_model.*)
+        if k2.startswith("inner_model."):
+            k2 = "model." + k2
+            inner_model_keys_fixed += 1
+        fixed_state_dict[k2] = v
+    
+    if inner_model_keys_fixed > 0:
+        log_rank_0(f"Fixed {inner_model_keys_fixed} inner_model.* keys to model.inner_model.*")
+    
+    missing, unexpected = model.load_state_dict(fixed_state_dict, strict=False)
+    log_rank_0(f"Loaded pretrained weights: {len(fixed_state_dict)} keys")
+    if missing:
+        log_rank_0(f"Missing keys (not loaded): {len(missing)} keys (first 10: {missing[:10]})")
+    if unexpected:
+        log_rank_0(f"Unexpected keys (ignored): {len(unexpected)} keys (first 10: {unexpected[:10]})")
 
 def load_msillm_from_torchhub(cfg: DictConfig) -> Tuple[Optional[torch.nn.Module], Optional[torch.nn.Module]]:
     """
@@ -895,12 +883,6 @@ def train(cfg: DictConfig) -> None:
         log_rank_0(f"\n{'='*60}")
         log_rank_0(f"Training completed!")
         log_rank_0(f"{'='*60}\n")
-                
-    except Exception as e:
-        logger.error(f"Training failed for seed {cfg.seed}: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
     finally:
         # Clear CUDA cache one final time
         clear_cuda_cache()
