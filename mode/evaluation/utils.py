@@ -555,7 +555,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
     if orig is None or not callable(orig):
         return None
 
-    def _reconstruct_normed(x_norm: torch.Tensor, sensor_name: str = "rgb_static") -> torch.Tensor:
+    def _reconstruct_normed(x_norm: torch.Tensor, sensor_name: str = "rgb_static"):
         mean, std = _clip_mean_std(x_norm.device, x_norm.dtype)
         x01 = (x_norm * std + mean).clamp(0.0, 1.0)
 
@@ -586,16 +586,28 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
         recon = recon.reshape(b, t, c, h, w)
         
         out = (recon - mean) / std
-        return out
+        return out, recon  # Return both normalized and denormalized tensors
 
     def _patched(self, rgb_static, rgb_gripper, latent_goal):
-        rgb_static_recon = _reconstruct_normed(rgb_static, sensor_name="rgb_static")
+        rgb_static_recon, rgb_static_recon_denorm = _reconstruct_normed(rgb_static, sensor_name="rgb_static")
         
         # Only reconstruct gripper if configured
         if compress_gripper:
-            rgb_gripper_recon = _reconstruct_normed(rgb_gripper, sensor_name="rgb_gripper")
+            rgb_gripper_recon, rgb_gripper_recon_denorm = _reconstruct_normed(rgb_gripper, sensor_name="rgb_gripper")
         else:
             rgb_gripper_recon = rgb_gripper
+            rgb_gripper_recon_denorm = None
+        
+        # Store reconstructed frames for video if enabled
+        if hasattr(self, '_store_reconstructed_frame') and self._store_reconstructed_frame:
+            # Extract single frame: [C, H, W] from [B, T, C, H, W]
+            if rgb_static_recon_denorm is not None:
+                static_frame = rgb_static_recon_denorm[0, 0] if rgb_static_recon_denorm.dim() == 5 else rgb_static_recon_denorm[0]
+                self._last_reconstructed_frame_tensor_rgb_static = static_frame
+            
+            if compress_gripper and rgb_gripper_recon_denorm is not None:
+                gripper_frame = rgb_gripper_recon_denorm[0, 0] if rgb_gripper_recon_denorm.dim() == 5 else rgb_gripper_recon_denorm[0]
+                self._last_reconstructed_frame_tensor_rgb_gripper = gripper_frame
         
         return orig(rgb_static_recon, rgb_gripper_recon, latent_goal)
 

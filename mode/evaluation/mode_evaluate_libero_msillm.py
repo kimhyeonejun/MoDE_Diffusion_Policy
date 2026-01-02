@@ -92,6 +92,12 @@ def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_stati
             rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
             return rgb_recon_np[..., ::-1]  # RGB to BGR
+        # For gripper: if compress_gripper is false, reconstructed frame won't exist, use original
+        elif sensor_name == 'rgb_gripper':
+            compress_gripper = getattr(model, '_compress_gripper', True)
+            if not compress_gripper:
+                # compress_gripper=false means use original, so fall through to original observation
+                pass
     
     # Use original observation
     if sensor_name == 'rgb_static':
@@ -351,8 +357,10 @@ class EvaluateLibero:
                 video_path_static = os.path.join(self.log_dir, video_filename_static)
                 video_path_gripper = os.path.join(self.log_dir, video_filename_gripper)
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
+                # Static images are 224x224, gripper images are 112x112
                 video_writer_static = cv2.VideoWriter(video_path_static, fourcc, 20.0, (self.img_w, self.img_h))
-                video_writer_gripper = cv2.VideoWriter(video_path_gripper, fourcc, 20.0, (self.img_w, self.img_h))
+                # Gripper video writer will be created after first frame to get correct size
+                video_writer_gripper = None
 
             env.reset()
 
@@ -395,8 +403,9 @@ class EvaluateLibero:
                         recon_frame = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_static"])
                         if recon_frame is not None:
                             model._last_reconstructed_frame_tensor_rgb_static = recon_frame
-                    # Reconstruct rgb_gripper if available
-                    if "rgb_gripper" in data["rgb_obs"]:
+                    # Reconstruct rgb_gripper if available and compress_gripper is enabled
+                    compress_gripper = getattr(model, '_compress_gripper', True)
+                    if "rgb_gripper" in data["rgb_obs"] and compress_gripper:
                         recon_frame_gripper = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_gripper"])
                         if recon_frame_gripper is not None:
                             model._last_reconstructed_frame_tensor_rgb_gripper = recon_frame_gripper
@@ -419,6 +428,12 @@ class EvaluateLibero:
                     # Save gripper frame
                     frame_gripper = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_gripper')
                     video_frames_gripper.append(frame_gripper)
+                    
+                    # Create gripper video writer with correct size on first frame
+                    if video_writer_gripper is None and frame_gripper is not None:
+                        h, w = frame_gripper.shape[:2]
+                        video_writer_gripper = cv2.VideoWriter(video_path_gripper, fourcc, 20.0, (w, h))
+                        print(f"[Video] Created gripper video writer with size {(w, h)}")
 
                 if done:
                     break
@@ -428,10 +443,13 @@ class EvaluateLibero:
                 for frame in video_frames_static:
                     video_writer_static.write(frame)
                 video_writer_static.release()
-                # Write gripper video
-                for frame in video_frames_gripper:
-                    video_writer_gripper.write(frame)
-                video_writer_gripper.release()
+                # Write gripper video (only if writer was created)
+                if video_writer_gripper is not None:
+                    for frame in video_frames_gripper:
+                        video_writer_gripper.write(frame)
+                    video_writer_gripper.release()
+                else:
+                    print(f"[Video] Warning: Gripper video writer was not created (no frames captured)")
 
             # a new form of success record
             num_success += int(done)
@@ -695,6 +713,13 @@ def main(cfg: DictConfig):
     
     # Setup MS-ILLM BPP measurement and video settings
     _setup_msillm_features(model, cfg)
+    
+    # Store compress_gripper setting on model for video reconstruction
+    # Try loaded_cfg first (merged config), then fallback to cfg
+    compress_gripper = OmegaConf.select(loaded_cfg, "msillm.compress_gripper", 
+                                       default=OmegaConf.select(cfg, "msillm.compress_gripper", default=True))
+    model._compress_gripper = compress_gripper
+    print(f"[Video] compress_gripper={compress_gripper} (stored on model)")
     
     # Ensure DataModule is setup to load statistics
     if not hasattr(dm, 'train_datasets') or not dm.train_datasets:
