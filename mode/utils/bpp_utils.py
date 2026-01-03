@@ -2,7 +2,7 @@
 Utilities for calculating Bits Per Pixel (BPP) for MS-ILLM compression.
 """
 import torch
-from typing import Dict, Optional, Tuple, Any, List, Union
+from typing import Dict, Optional, Tuple, Any
 
 try:
     from neuralcompression.metrics import pickle_size_of
@@ -11,78 +11,6 @@ except ImportError:
     import pickle
     def pickle_size_of(obj):
         return len(pickle.dumps(obj))
-
-
-def calculate_bpp_from_latent(
-    latent: torch.Tensor,
-    original_shape: Tuple[int, ...],
-    bits_per_element: int = 8,
-    use_compressed_size: bool = False,
-) -> float:
-    """
-    Calculate Bits Per Pixel (BPP) from a compressed latent representation.
-    
-    Args:
-        latent: Compressed latent tensor from encoder (any shape)
-        original_shape: Original image shape (C, H, W) or (B, C, H, W)
-        bits_per_element: Number of bits per element in the latent (default: 8 for quantized)
-        use_compressed_size: If True, use actual compressed image size (256x256 for MS-ILLM).
-                            If False, use original image size. Default False to calculate BPP
-                            based on original image size (standard definition of BPP).
-    
-    Returns:
-        BPP value (bits per pixel)
-    """
-    # Calculate total bits in latent
-    num_elements = latent.numel()
-    total_bits = num_elements * bits_per_element
-    
-    # if use_compressed_size:
-    #     # Use actual compressed image size (MS-ILLM expects 256x256)
-    #     # This gives fair comparison when different sized images are resized to same size
-    #     num_pixels = 256 * 256
-    # else:
-        # Get number of pixels in original image
-    if len(original_shape) == 3:
-        # (C, H, W)
-        num_pixels = original_shape[1] * original_shape[2]
-    elif len(original_shape) == 4:
-        # (B, C, H, W)
-        num_pixels = original_shape[2] * original_shape[3]
-    else:
-        raise ValueError(f"Unexpected original_shape: {original_shape}")
-
-    # BPP = total_bits / num_pixels
-    bpp = total_bits / num_pixels
-    return bpp
-
-
-def calculate_bpp_from_encoder_output(
-    encoder_output: torch.Tensor,
-    original_image: torch.Tensor,
-    bits_per_element: int = 8,
-    use_compressed_size: bool = False,
-) -> float:
-    """
-    Calculate BPP from encoder output and original image.
-    
-    Args:
-        encoder_output: Output from MS-ILLM encoder (latent z)
-        original_image: Original image tensor (B, C, H, W) or (C, H, W)
-        bits_per_element: Number of bits per element in latent
-        use_compressed_size: If True, use actual compressed image size (256x256 for MS-ILLM).
-                            If False, use original image size. Default False to calculate BPP
-                            based on original image size (standard definition of BPP).
-    
-    Returns:
-        BPP value
-    """
-    return calculate_bpp_from_latent(
-        encoder_output,
-        original_image.shape,
-        bits_per_element=bits_per_element,
-        use_compressed_size=use_compressed_size,
-    )
 
 
 def calculate_bpp_from_hyperprior_output(

@@ -506,17 +506,25 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
     if orig is None or not callable(orig):
         return None
 
-    def _reconstruct_normed(x_norm: torch.Tensor, sensor_name: str = "rgb_static"):
-        mean, std = _clip_mean_std(x_norm.device, x_norm.dtype)
-        x01 = (x_norm * std + mean).clamp(0.0, 1.0)
+    def _reconstruct_normed(x01: torch.Tensor, sensor_name: str = "rgb_static"):
+        # x01: (B, T, C, H, W) in [0, 1] range (Normalize transform removed)
+        mean, std = _clip_mean_std(x01.device, x01.dtype)
 
         b, t, c, h, w = x01.shape
         x01_bt = x01.reshape(b * t, c, h, w)
 
-        # MS-ILLM requires images to be divisible by 16
-        # Evaluation images are already 16's multiple (224=16*14, 112=16*7), so no resize needed
-        # Just use the images directly without interpolation
-        x01_bt_resized = x01_bt
+        # MS-ILLM requires images to be divisible by 64
+        # Evaluation images are not already 64's multiple (224=16*14, 112=16*7)
+        factor = 64  # MS-ILLM requires 64's multiple
+        if h % factor != 0 or w % factor != 0:
+            # Resize to nearest multiple of 64
+            new_h = ((h + factor - 1) // factor) * factor
+            new_w = ((w + factor - 1) // factor) * factor
+            x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
+            resize_needed = True
+        else:
+            x01_bt_resized = x01_bt
+            resize_needed = False   
 
         with torch.no_grad():
             # Use compress/decompress (same as official MS-ILLM evaluation code)
@@ -530,12 +538,12 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
                 # Fallback if compress doesn't exist
                 recon_resized = x01_bt_resized
         # Resize back to original size if needed
-        recon = recon_resized
-        if recon.shape != x01_bt.shape and recon.numel() == x01_bt.numel():
-            recon = recon.view_as(x01_bt)
+        if resize_needed:
+            recon = F.interpolate(recon_resized, size=(h, w), mode='bilinear', align_corners=False)
+        else:
+            recon = recon_resized
 
         recon = recon.reshape(b, t, c, h, w)
-        
         out = (recon - mean) / std
         return out, recon  # Return both normalized and denormalized tensors
 
@@ -547,7 +555,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
             rgb_gripper_recon, rgb_gripper_recon_denorm = _reconstruct_normed(rgb_gripper, sensor_name="rgb_gripper")
         else:
             rgb_gripper_recon = rgb_gripper
-            rgb_gripper_recon_denorm = None
+            rgb_gripper_recon_denorm = None  # Use original env image (224x224) when not compressing
         
         # Store reconstructed frames for video if enabled
         if hasattr(self, '_store_reconstructed_frame') and self._store_reconstructed_frame:
@@ -730,43 +738,6 @@ class LangEmbeddings:
 
     def get_lang_goal(self, task):
         return {"lang": torch.from_numpy(self.lang_embeddings[task]).to(self.device).squeeze(0).float()}
-
-
-def imshow_tensor(window, img_tensor, wait=0, resize=True, keypoints=None, text=None):
-    img_tensor = img_tensor.squeeze()
-    img = np.transpose(img_tensor.cpu().numpy(), (1, 2, 0))
-    img = np.clip(((img / 2) + 0.5) * 255, 0, 255).astype(np.uint8)
-
-    if keypoints is not None:
-        key_coords = np.clip(keypoints * 200 + 100, 0, 200)
-        key_coords = key_coords.reshape(-1, 2)
-        cv_kp1 = [cv2.KeyPoint(x=pt[1], y=pt[0], _size=1) for pt in key_coords]
-        img = cv2.drawKeypoints(img, cv_kp1, None, color=(255, 0, 0))
-
-    if text is not None:
-        add_text(img, text)
-
-    if resize:
-        cv2.imshow(window, cv2.resize(img[:, :, ::-1], (500, 500)))
-    else:
-        cv2.imshow(window, img[:, :, ::-1])
-    cv2.waitKey(wait)
-
-
-def print_task_log(demo_task_counter, live_task_counter, mod):
-    print()
-    logger.info(f"Modality: {mod}")
-    for task in demo_task_counter:
-        logger.info(
-            f"{task}: SR = {(live_task_counter[task] / demo_task_counter[task]) * 100:.0f}%"
-            + f" |  {live_task_counter[task]} of {demo_task_counter[task]}"
-        )
-    s = sum(demo_task_counter.values())
-    success_rate = (sum(live_task_counter.values()) / s if s > 0 else 0) * 100
-    logger.info(f"Average Success Rate {mod} = {success_rate:.0f}%")
-    logger.info(
-        f"Success Rates averaged throughout classes = {np.mean([live_task_counter[task] / demo_task_counter[task] for task in demo_task_counter]) * 100:.0f}%"
-    )
 
 
 @contextlib.contextmanager

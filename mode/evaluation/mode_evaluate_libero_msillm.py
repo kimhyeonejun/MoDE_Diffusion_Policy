@@ -6,7 +6,6 @@ import sys
 import time
 import gc
 
-import cv2
 import hydra
 import imageio
 import numpy as np
@@ -28,10 +27,9 @@ if libero_repo_dir.exists():
     current_pythonpath = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
 
-from mode.evaluation.utils import get_msillm_mode_and_env, reconstruct_frame_for_video
+from mode.evaluation.utils import get_msillm_mode_and_env, reconstruct_frame_for_video, _clip_mean_std
 from mode.evaluation.multistep_sequences import get_sequences
 from mode.utils.bpp_utils import (
-    calculate_bpp_from_encoder_output,
     calculate_bpp_from_hyperprior_output,
     accumulate_bpp_stats,
     compute_average_bpp,
@@ -60,23 +58,16 @@ def _calculate_bpp_from_latents(bpp_wrapper, data, sensors):
     """Calculate BPP from captured latents."""
     if bpp_wrapper is None or len(bpp_wrapper.latents) == 0:
         return {}
-    
     bpp_dict = {}
     latents = bpp_wrapper.latents[-len(sensors):]
     for sensor_name, latent in zip(sensors, latents):
         img = data["rgb_obs"][sensor_name].squeeze(0)  # (C, H, W)
-        try:
-            if hasattr(latent, "latent_strings"):
-                bpp = calculate_bpp_from_hyperprior_output(latent, img.shape)
-            else:
-                bpp = calculate_bpp_from_encoder_output(latent, img, bits_per_element=8)
-            bpp_dict[sensor_name] = bpp
-        except Exception as e:
-            log_print.warning(f"Failed to calculate BPP for {sensor_name}: {e}")
+        bpp = calculate_bpp_from_hyperprior_output(latent, img.shape)
+        bpp_dict[sensor_name] = bpp
     return bpp_dict
 
 
-def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_static'):
+def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_static', data=None):
     """Prepare video frame from model or observation.
     
     Args:
@@ -84,6 +75,7 @@ def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_stati
         obs: Environment observation dictionary
         store_reconstructed: Whether to use reconstructed frames
         sensor_name: 'rgb_static' or 'rgb_gripper'
+        data: Optional transformed data dictionary (to use transforms-processed images)
     """
     if store_reconstructed:
         # Check for sensor-specific reconstructed frame
@@ -93,25 +85,18 @@ def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_stati
             rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
             return rgb_recon_np[..., ::-1]  # RGB to BGR
-        # For gripper: if compress_gripper is false, reconstructed frame won't exist, use original
-        elif sensor_name == 'rgb_gripper':
-            compress_gripper = getattr(model, '_compress_gripper', True)
-            if not compress_gripper:
-                # compress_gripper=false means use original, so fall through to original observation
-                pass
     
-    # Use original observation
-    if sensor_name == 'rgb_static':
-        frame = obs['agentview_image']
-    elif sensor_name == 'rgb_gripper':
-        frame = obs['robot0_eye_in_hand_image']
-    else:
-        raise ValueError(f"Unknown sensor_name: {sensor_name}")
-    
-    if isinstance(frame, np.ndarray):
+    # Use transforms-processed image if available (already in [0, 1] range, no denormalize needed)
+    if data is not None and sensor_name in data.get("rgb_obs", {}):
+        img_tensor = data["rgb_obs"][sensor_name].squeeze(0)[0]  # [1, T, C, H, W] -> [C, H, W]
+        frame = (img_tensor.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         frame = np.rot90(frame, k=2, axes=(0, 1))
-        frame = frame[..., ::-1]
-    return frame
+        return frame[..., ::-1]  # RGB to BGR
+    
+    # # Fallback: Use original observation
+    # frame = obs['agentview_image'] if sensor_name == 'rgb_static' else obs['robot0_eye_in_hand_image']
+    # frame = np.rot90(frame, k=2, axes=(0, 1)) if isinstance(frame, np.ndarray) else frame
+    # return frame[..., ::-1]
 
 
 class LatentCaptureWrapper:
@@ -324,6 +309,7 @@ class EvaluateLibero:
             "camera_heights": self.img_h,
             "camera_widths": self.img_w,
         }
+        compress_gripper = getattr(model, '_compress_gripper', True)
 
         # Try to handle the frame buffer issue
         env_creation = False
@@ -401,14 +387,15 @@ class EvaluateLibero:
                         if recon_frame is not None:
                             model._last_reconstructed_frame_tensor_rgb_static = recon_frame
                     # Reconstruct rgb_gripper if available and compress_gripper is enabled
-                    compress_gripper = getattr(model, '_compress_gripper', True)
                     if "rgb_gripper" in data["rgb_obs"] and compress_gripper:
                         recon_frame_gripper = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_gripper"])
                         if recon_frame_gripper is not None:
                             model._last_reconstructed_frame_tensor_rgb_gripper = recon_frame_gripper
 
                 # Calculate BPP from captured latents
-                sensors = [k for k in ("rgb_static", "rgb_gripper") if k in data.get("rgb_obs", {})]
+                sensors = ["rgb_static"] if "rgb_static" in data.get("rgb_obs", {}) else []
+                if compress_gripper and "rgb_gripper" in data.get("rgb_obs", {}):
+                    sensors.append("rgb_gripper")
                 bpp_dict = _calculate_bpp_from_latents(bpp_wrapper, data, sensors)
                 if bpp_dict:
                     self.bpp_stats = accumulate_bpp_stats(bpp_dict, self.bpp_stats)
@@ -419,11 +406,11 @@ class EvaluateLibero:
                 if store_video_this_rollout:
                     store_reconstructed = (hasattr(model, '_store_reconstructed_frame') 
                                          and model._store_reconstructed_frame)
-                    # Save static frame
-                    frame_static = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_static')
+                    # Save static frame (use data for transforms-processed image if no reconstructed frame)
+                    frame_static = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_static', data=data)
                     video_frames_static.append(frame_static)
-                    # Save gripper frame
-                    frame_gripper = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_gripper')
+                    # Save gripper frame (use data for transforms-processed image if no reconstructed frame)
+                    frame_gripper = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_gripper', data=data)
                     video_frames_gripper.append(frame_gripper)
 
                 if done:

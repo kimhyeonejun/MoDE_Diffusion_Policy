@@ -40,28 +40,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# region agent log helpers
-_DEBUG_LOG_PATH = "/home/khj20343/MoDE_Diffusion_Policy/.cursor/debug.log"
-_DEBUG_SESSION_ID = "debug-session"
-
-def _agent_log(*, runId: str, hypothesisId: str, location: str, message: str, data: dict) -> None:
-    """Write one NDJSON line to the debug log (best-effort)."""
-    try:
-        payload = {
-            "sessionId": _DEBUG_SESSION_ID,
-            "runId": runId,
-            "hypothesisId": hypothesisId,
-            "location": location,
-            "message": message,
-            "data": data,
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        # Never break training due to debug logging.
-        pass
-# endregion
 
 def _set_requires_grad(module: Optional[torch.nn.Module], requires_grad: bool) -> None:
     if module is None:
@@ -511,12 +489,9 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
     if orig is None or not callable(orig):
         return None
 
-    did_log = {"v": False}
-
-    def _reconstruct_normed(x_norm: torch.Tensor) -> torch.Tensor:
-        # x_norm: (B, T, C, H, W) normalized by CLIP mean/std
-        mean, std = _clip_mean_std(x_norm.device, x_norm.dtype)
-        x01 = (x_norm * std + mean).clamp(0.0, 1.0)
+    def _reconstruct_normed(x01: torch.Tensor) -> torch.Tensor:
+        # x01: (B, T, C, H, W) in [0, 1] range (Normalize transform removed)
+        mean, std = _clip_mean_std(x01.device, x01.dtype)
 
         b, t, c, h, w = x01.shape
         x01_bt = x01.reshape(b * t, c, h, w)
@@ -589,20 +564,6 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
         # Only reconstruct gripper if configured
         if compress_gripper:
             rgb_gripper = _reconstruct_normed(rgb_gripper)
-
-        if not did_log["v"]:
-            did_log["v"] = True
-            _agent_log(
-                runId="joint-train",
-                hypothesisId="msillm-forward",
-                location="mode/training_libero_msillm.py:patch_modeagent_embed_visual_obs_for_msillm",
-                message=f"Applied forward-time MS-ILLM recon (static={'yes'}, gripper={'yes' if compress_gripper else 'no'})",
-                data={
-                    "rgb_static_shape": list(rgb_static.shape),
-                    "rgb_gripper_shape": list(rgb_gripper.shape),
-                    "gripper_compression": compress_gripper,
-                },
-            )
 
         # Call original embed_visual_obs (bound method) with reconstructed static and (optionally) gripper images.
         return orig(rgb_static, rgb_gripper, latent_goal)
@@ -762,23 +723,6 @@ def train(cfg: DictConfig) -> None:
         # Patch embed_visual_obs to route images through MS-ILLM encoder(no_grad)/decoder(grad) in forward.
         compress_gripper = cfg.msillm.get("compress_gripper", True) if "msillm" in cfg else True
         patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper)
-
-        # region agent log
-        _agent_log(
-            runId="pre-fix",
-            hypothesisId="B",
-            location="mode/training_libero_msillm.py:train",
-            message="Policy frozen except vision encoders (+ optional MS-ILLM decoder patch)",
-            data={
-                "policy_type": type(model).__name__,
-                "policy_total_params": _count_params(model)[0],
-                "policy_trainable_params": _count_params(model)[1],
-                "policy_trainable_param_names_head": _first_trainable_param_names(model, max_items=20),
-                "compression_decoder_present": compression_decoder is not None,
-                "compression_decoder_trainable_params": _count_params(compression_decoder)[1] if compression_decoder is not None else 0,
-            },
-        )
-        # endregion
         
         # Load pretrained weights if configured
         if "pretrain_chk" in cfg:
