@@ -521,10 +521,10 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
         b, t, c, h, w = x01.shape
         x01_bt = x01.reshape(b * t, c, h, w)
 
-        # MS-ILLM requires images to be divisible by 16
-        # Resize to nearest multiple of 16 if needed (112 is already 16*7, so no resize needed)
-        # 224 needs to be resized to 16's multiple (e.g., 224 -> 240 or 256)
-        factor = 64  # MS-ILLM requires 16's multiple
+        # MS-ILLM requires images to be divisible by 64 during training
+        # Resize to nearest multiple of 64 if needed
+        # 224 needs to be resized to 64's multiple (e.g., 224 -> 240 or 256)
+        factor = 64  # MS-ILLM requires 64's multiple
         if h % factor != 0 or w % factor != 0:
             # Resize to nearest multiple of 16
             new_h = ((h + factor - 1) // factor) * factor

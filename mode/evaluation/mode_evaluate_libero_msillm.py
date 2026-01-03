@@ -8,6 +8,7 @@ import gc
 
 import cv2
 import hydra
+import imageio
 import numpy as np
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from pytorch_lightning import seed_everything
@@ -356,11 +357,7 @@ class EvaluateLibero:
                 video_filename_gripper = f"rollout_{task_str}_gripper_nmp_{i}.mp4"
                 video_path_static = os.path.join(self.log_dir, video_filename_static)
                 video_path_gripper = os.path.join(self.log_dir, video_filename_gripper)
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the codec for MP4
-                # Static images are 224x224, gripper images are 112x112
-                video_writer_static = cv2.VideoWriter(video_path_static, fourcc, 20.0, (self.img_w, self.img_h))
-                # Gripper video writer will be created after first frame to get correct size
-                video_writer_gripper = None
+                fps = 20.0  # Frame rate
 
             env.reset()
 
@@ -428,28 +425,34 @@ class EvaluateLibero:
                     # Save gripper frame
                     frame_gripper = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_gripper')
                     video_frames_gripper.append(frame_gripper)
-                    
-                    # Create gripper video writer with correct size on first frame
-                    if video_writer_gripper is None and frame_gripper is not None:
-                        h, w = frame_gripper.shape[:2]
-                        video_writer_gripper = cv2.VideoWriter(video_path_gripper, fourcc, 20.0, (w, h))
-                        print(f"[Video] Created gripper video writer with size {(w, h)}")
 
                 if done:
                     break
 
             if store_video_this_rollout:
-                # Write static video
-                for frame in video_frames_static:
-                    video_writer_static.write(frame)
-                video_writer_static.release()
-                # Write gripper video (only if writer was created)
-                if video_writer_gripper is not None:
-                    for frame in video_frames_gripper:
-                        video_writer_gripper.write(frame)
-                    video_writer_gripper.release()
+                # Write static video using imageio
+                if len(video_frames_static) > 0:
+                    video_writer_static = imageio.get_writer(video_path_static, fps=fps)
+                    for frame in video_frames_static:
+                        # Convert BGR to RGB for imageio
+                        frame_rgb = frame[..., ::-1]
+                        video_writer_static.append_data(frame_rgb)
+                    video_writer_static.close()
+                    print(f"[Video] Saved static video: {video_path_static} ({len(video_frames_static)} frames)")
                 else:
-                    print(f"[Video] Warning: Gripper video writer was not created (no frames captured)")
+                    print(f"[Video] Warning: No static frames captured for video")
+                
+                # Write gripper video using imageio
+                if len(video_frames_gripper) > 0:
+                    video_writer_gripper = imageio.get_writer(video_path_gripper, fps=fps)
+                    for frame in video_frames_gripper:
+                        # Convert BGR to RGB for imageio
+                        frame_rgb = frame[..., ::-1]
+                        video_writer_gripper.append_data(frame_rgb)
+                    video_writer_gripper.close()
+                    print(f"[Video] Saved gripper video: {video_path_gripper} ({len(video_frames_gripper)} frames)")
+                else:
+                    print(f"[Video] Warning: No gripper frames captured for video")
 
             # a new form of success record
             num_success += int(done)

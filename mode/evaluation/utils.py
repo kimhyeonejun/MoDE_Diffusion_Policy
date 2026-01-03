@@ -147,55 +147,6 @@ def load_pl_module_from_checkpoint(
     return model
 
 
-
-def get_default_model_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, device_id=0):
-    train_cfg_path = Path(train_folder) / ".hydra/config.yaml"
-    train_cfg_path = format_sftp_path(train_cfg_path)
-    cfg = OmegaConf.load(train_cfg_path)
-    lang_folder = cfg.datamodule.datasets.lang_dataset.lang_folder
-    if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
-        hydra.initialize("../../conf/datamodule/datasets")
-    # we don't want to use shm dataset for evaluation
-    datasets_cfg = hydra.compose("vision_lang.yaml", overrides=["lang_dataset.lang_folder=" + lang_folder])
-    # since we don't use the trainer during inference, manually set up data_module
-    cfg.datamodule.datasets = datasets_cfg
-    cfg.datamodule.root_data_dir = dataset_path
-    data_module = hydra.utils.instantiate(cfg.datamodule, num_workers=0)
-    data_module.prepare_data()
-    data_module.setup()
-    dataloader = data_module.val_dataloader()
-    dataset = dataloader.dataset.datasets["lang"]
-    device = get_device(device_id)
-
-    if lang_embeddings is None:
-        lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
-
-    if env is None:
-        rollout_cfg = OmegaConf.load(Path(__file__).parents[2] / "conf/callbacks/rollout/default.yaml")
-        env = hydra.utils.instantiate(rollout_cfg.env_cfg, dataset, device, show_gui=False)
-
-    checkpoint = format_sftp_path(checkpoint)
-    print(f"Loading model from {checkpoint}")
-
-    # new stuff
-    epoch = cfg.epoch_to_load if "epoch_to_load" in cfg else -1
-    overwrite_cfg = cfg.overwrite_module_cfg if "overwrite_module_cfg" in cfg else {}
-    module_path = str(Path(train_folder).expanduser())
-    model = load_pl_module_from_checkpoint(
-        module_path,
-        epoch=epoch,
-        overwrite_cfg=overwrite_cfg,
-    )
-    # model = Hulc.load_from_checkpoint(checkpoint)
-    model.freeze()
-    if cfg.model.action_decoder.get("load_action_bounds", False):
-        model.action_decoder._setup_action_bounds(cfg.datamodule.root_data_dir, None, None, True)
-    model = move_model_to_device(model, device)
-    print("Successfully loaded model.")
-
-    return model, env, data_module, lang_embeddings
-
-
 def get_default_mode_and_env(train_folder, dataset_path, checkpoint, env=None, lang_embeddings=None, prep_dm_and_deps=True, device_id=0, eval_cfg_overwrite={}):
     """Load model and environment for evaluation (without MS-ILLM)."""
     checkpoint_str = str(checkpoint)
