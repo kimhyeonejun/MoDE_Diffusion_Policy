@@ -27,7 +27,7 @@ if libero_repo_dir.exists():
     current_pythonpath = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
 
-from mode.evaluation.utils import get_msillm_mode_and_env, reconstruct_frame_for_video, _clip_mean_std
+from mode.evaluation.utils import get_msillm_mode_and_env, reconstruct_frame_for_video
 from mode.evaluation.multistep_sequences import get_sequences
 from mode.utils.bpp_utils import (
     calculate_bpp_from_hyperprior_output,
@@ -82,9 +82,9 @@ def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_stati
         tensor_attr = f'_last_reconstructed_frame_tensor_{sensor_name}'
         if hasattr(model, tensor_attr):
             recon_frame = getattr(model, tensor_attr)
-            rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
-            return rgb_recon_np[..., ::-1]  # RGB to BGR
+        rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
+        return rgb_recon_np[..., ::-1]  # RGB to BGR
     
     # Use transforms-processed image if available (already in [0, 1] range, no denormalize needed)
     if data is not None and sensor_name in data.get("rgb_obs", {}):
@@ -602,14 +602,14 @@ def _resolve_checkpoint_path(cfg):
     
     # If checkpoint is not specified, use pretrain_chk from config
     if not cfg.checkpoint or cfg.checkpoint in ("", "null", None):
-        if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
-            hydra.initialize("../../conf")
-        base_cfg = hydra.compose(config_name="config_libero_msillm")
-        if hasattr(base_cfg, "pretrain_chk") and base_cfg.pretrain_chk:
-            cfg.checkpoint = base_cfg.pretrain_chk
-            print(f"No checkpoint specified, using pretrained checkpoint: {cfg.checkpoint}")
-        else:
-            raise ValueError("No checkpoint specified and pretrain_chk not found in config")
+            if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
+                hydra.initialize("../../conf")
+            base_cfg = hydra.compose(config_name="config_libero_msillm")
+            if hasattr(base_cfg, "pretrain_chk") and base_cfg.pretrain_chk:
+                cfg.checkpoint = base_cfg.pretrain_chk
+                print(f"No checkpoint specified, using pretrained checkpoint: {cfg.checkpoint}")
+            else:
+                raise ValueError("No checkpoint specified and pretrain_chk not found in config")
 
 
 def _sanitize_checkpoint_path(cfg):

@@ -440,7 +440,7 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     
     Args:
         model: Model with msillm_model attribute
-        rgb_static_tensor: Normalized RGB tensor [1, 1, C, H, W] or [1, C, H, W]
+        rgb_static_tensor: RGB tensor in [0, 1] range [1, 1, C, H, W] or [1, C, H, W]
     
     Returns:
         Reconstructed frame tensor [C, H, W] on GPU, or None if MS-ILLM not available
@@ -452,9 +452,6 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     if not hasattr(msillm, "compress") or not hasattr(msillm, "decompress"):
         return None
     
-    device = rgb_static_tensor.device
-    mean, std = _clip_mean_std(device, rgb_static_tensor.dtype)
-    
     # Ensure correct shape: [1, 1, C, H, W] (B, T, C, H, W format)
     if rgb_static_tensor.dim() == 4:
         rgb_static_tensor = rgb_static_tensor.unsqueeze(1)  # [1, C, H, W] -> [1, 1, C, H, W]
@@ -463,22 +460,32 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     else:
         return None  # Unexpected shape
     
-    # Denormalize and reshape to [B*T, C, H, W]
-    x01 = (rgb_static_tensor * std + mean).clamp(0.0, 1.0)
+    # Input is already in [0, 1] range (Normalize transform removed)
+    x01 = rgb_static_tensor.clamp(0.0, 1.0)
     b, t, c, h, w = x01.shape
     x01_bt = x01.reshape(b * t, c, h, w)
     
-    # MS-ILLM requires images to be divisible by 16
-    # Evaluation images are already 16's multiple (224=16*14, 112=16*7), so no resize needed
-    # Just use the images directly without interpolation
-    x01_bt_resized = x01_bt
+    # MS-ILLM requires images to be divisible by 64
+    factor = 64
+    if h % factor != 0 or w % factor != 0:
+        new_h = ((h + factor - 1) // factor) * factor
+        new_w = ((w + factor - 1) // factor) * factor
+        x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        resize_needed = True
+    else:
+        x01_bt_resized = x01_bt
+        resize_needed = False
     
     # Compress/Decompress (this triggers LatentCaptureWrapper if present)
     with torch.no_grad():
         compressed = msillm.compress(x01_bt_resized, force_cpu=False)
         recon_resized = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
     
-    recon = recon_resized
+    # Resize back to original size if needed
+    if resize_needed:
+        recon = F.interpolate(recon_resized, size=(h, w), mode='bilinear', align_corners=False)
+    else:
+        recon = recon_resized
     
     # Extract single frame: [C, H, W]
     recon_frame = recon[0] if recon.dim() == 4 else recon.squeeze(0)
@@ -554,7 +561,9 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
         if compress_gripper:
             rgb_gripper_recon, rgb_gripper_recon_denorm = _reconstruct_normed(rgb_gripper, sensor_name="rgb_gripper")
         else:
-            rgb_gripper_recon = rgb_gripper
+            # Normalize gripper image even when not compressing (inputs are in [0, 1] range)
+            mean, std = _clip_mean_std(rgb_gripper.device, rgb_gripper.dtype)
+            rgb_gripper_recon = (rgb_gripper - mean) / std
             rgb_gripper_recon_denorm = None  # Use original env image (224x224) when not compressing
         
         # Store reconstructed frames for video if enabled

@@ -564,6 +564,10 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
         # Only reconstruct gripper if configured
         if compress_gripper:
             rgb_gripper = _reconstruct_normed(rgb_gripper)
+        else:
+            # Normalize gripper image even when not compressing (inputs are in [0, 1] range)
+            mean, std = _clip_mean_std(rgb_gripper.device, rgb_gripper.dtype)
+            rgb_gripper = (rgb_gripper - mean) / std
 
         # Call original embed_visual_obs (bound method) with reconstructed static and (optionally) gripper images.
         return orig(rgb_static, rgb_gripper, latent_goal)
