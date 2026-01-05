@@ -384,8 +384,8 @@ class EvaluateLibero:
                     # Reconstruct rgb_static if available
                     if "rgb_static" in data["rgb_obs"]:
                         recon_frame = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_static"])
-                        if recon_frame is not None:
-                            model._last_reconstructed_frame_tensor_rgb_static = recon_frame
+                    if recon_frame is not None:
+                        model._last_reconstructed_frame_tensor_rgb_static = recon_frame
                     # Reconstruct rgb_gripper if available and compress_gripper is enabled
                     if "rgb_gripper" in data["rgb_obs"] and compress_gripper:
                         recon_frame_gripper = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_gripper"])

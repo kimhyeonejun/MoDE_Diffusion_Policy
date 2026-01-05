@@ -465,16 +465,23 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     b, t, c, h, w = x01.shape
     x01_bt = x01.reshape(b * t, c, h, w)
     
-    # MS-ILLM requires images to be divisible by 64
-    factor = 64
-    if h % factor != 0 or w % factor != 0:
-        new_h = ((h + factor - 1) // factor) * factor
-        new_w = ((w + factor - 1) // factor) * factor
-        x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
-        resize_needed = True
-    else:
+    # Check if resize should be skipped (e.g., when using Hugging Face repo checkpoint)
+    skip_resize = getattr(model, "_skip_resize_for_reconstruction", False)
+    resize_needed = False
+    if skip_resize:
+        # Skip resize, use original size directly
         x01_bt_resized = x01_bt
-        resize_needed = False
+    else:
+        # MS-ILLM requires images to be divisible by 64
+        factor = 64
+        if h % factor != 0 or w % factor != 0:
+            new_h = ((h + factor - 1) // factor) * factor
+            new_w = ((w + factor - 1) // factor) * factor
+            x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
+            resize_needed = True
+        else:
+            x01_bt_resized = x01_bt
+            resize_needed = False
     
     # Compress/Decompress (this triggers LatentCaptureWrapper if present)
     with torch.no_grad():
@@ -491,7 +498,7 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     recon_frame = recon[0] if recon.dim() == 4 else recon.squeeze(0)
     return recon_frame
 
-def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = True):
+def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = True, skip_resize: bool = False):
     msillm = getattr(model, "msillm_model", None)
     if msillm is None:
         return None
@@ -508,6 +515,9 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
             print(f"[WARNING] Failed to update tensor devices for compression: {e}")
 
     msillm.eval()
+    
+    # Store skip_resize flag on model for reconstruct_frame_for_video
+    model._skip_resize_for_reconstruction = skip_resize
 
     orig = getattr(model, "embed_visual_obs", None)
     if orig is None or not callable(orig):
@@ -522,16 +532,22 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
 
         # MS-ILLM requires images to be divisible by 64
         # Evaluation images are not already 64's multiple (224=16*14, 112=16*7)
-        factor = 64  # MS-ILLM requires 64's multiple
-        if h % factor != 0 or w % factor != 0:
-            # Resize to nearest multiple of 64
-            new_h = ((h + factor - 1) // factor) * factor
-            new_w = ((w + factor - 1) // factor) * factor
-            x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
-            resize_needed = True
-        else:
+        # Skip resize if flag is set (e.g., when using Hugging Face repo checkpoint)
+        resize_needed = False
+        if skip_resize:
+            # Skip resize, use original size directly
             x01_bt_resized = x01_bt
-            resize_needed = False   
+        else:
+            factor = 64  # MS-ILLM requires 64's multiple
+            if h % factor != 0 or w % factor != 0:
+                # Resize to nearest multiple of 64
+                new_h = ((h + factor - 1) // factor) * factor
+                new_w = ((w + factor - 1) // factor) * factor
+                x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                resize_needed = True
+            else:
+                x01_bt_resized = x01_bt
+                resize_needed = False   
 
         with torch.no_grad():
             # Use compress/decompress (same as official MS-ILLM evaluation code)
@@ -712,8 +728,10 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
     # Patch MS-ILLM and move to device
     # Get compress_gripper setting from config (default to True for backward compatibility)
     compress_gripper = OmegaConf.select(cfg, "msillm.compress_gripper", default=True)
-    patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper)
-    print(f"[MS-ILLM] compress_gripper={compress_gripper}")
+    # Skip resize when using Hugging Face repo checkpoint (no local checkpoint file)
+    skip_resize = is_hf_repo
+    patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper, skip_resize=skip_resize)
+    print(f"[MS-ILLM] compress_gripper={compress_gripper}, skip_resize={skip_resize}")
     model.freeze()
     model = move_model_to_device(model, device)
     
