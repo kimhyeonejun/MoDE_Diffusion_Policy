@@ -310,6 +310,7 @@ class EvaluateLibero:
             "camera_widths": self.img_w,
         }
         compress_gripper = getattr(model, '_compress_gripper', True)
+        compress_rgb = getattr(model, '_compress_rgb', True)
 
         # Try to handle the frame buffer issue
         env_creation = False
@@ -381,11 +382,11 @@ class EvaluateLibero:
                 if (store_video_this_rollout 
                     and hasattr(model, '_store_reconstructed_frame') 
                     and model._store_reconstructed_frame):
-                    # Reconstruct rgb_static if available
-                    if "rgb_static" in data["rgb_obs"]:
+                    # Reconstruct rgb_static if available and compress_rgb is enabled
+                    if "rgb_static" in data["rgb_obs"] and compress_rgb:
                         recon_frame = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_static"])
-                    if recon_frame is not None:
-                        model._last_reconstructed_frame_tensor_rgb_static = recon_frame
+                        if recon_frame is not None:
+                            model._last_reconstructed_frame_tensor_rgb_static = recon_frame
                     # Reconstruct rgb_gripper if available and compress_gripper is enabled
                     if "rgb_gripper" in data["rgb_obs"] and compress_gripper:
                         recon_frame_gripper = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_gripper"])
@@ -393,7 +394,9 @@ class EvaluateLibero:
                             model._last_reconstructed_frame_tensor_rgb_gripper = recon_frame_gripper
 
                 # Calculate BPP from captured latents
-                sensors = ["rgb_static"] if "rgb_static" in data.get("rgb_obs", {}) else []
+                sensors = []
+                if compress_rgb and "rgb_static" in data.get("rgb_obs", {}):
+                    sensors.append("rgb_static")
                 if compress_gripper and "rgb_gripper" in data.get("rgb_obs", {}):
                     sensors.append("rgb_gripper")
                 bpp_dict = _calculate_bpp_from_latents(bpp_wrapper, data, sensors)
@@ -710,6 +713,13 @@ def main(cfg: DictConfig):
                                        default=OmegaConf.select(cfg, "msillm.compress_gripper", default=True))
     model._compress_gripper = compress_gripper
     print(f"[Video] compress_gripper={compress_gripper} (stored on model)")
+    
+    # Store compress_rgb setting on model for video reconstruction
+    # Try loaded_cfg first (merged config), then fallback to cfg
+    compress_rgb = OmegaConf.select(loaded_cfg, "msillm.compress_rgb", 
+                                    default=OmegaConf.select(cfg, "msillm.compress_rgb", default=True))
+    model._compress_rgb = compress_rgb
+    print(f"[Video] compress_rgb={compress_rgb} (stored on model)")
     
     # Ensure DataModule is setup to load statistics
     if not hasattr(dm, 'train_datasets') or not dm.train_datasets:
