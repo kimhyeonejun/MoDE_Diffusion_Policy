@@ -75,7 +75,7 @@ instance/
 .scrapy
 slurm_scripts/
 logs/
-
+saved_models/
 # Sphinx documentation
 docs/_build/
 /pretrained_models

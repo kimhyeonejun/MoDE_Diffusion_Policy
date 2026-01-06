@@ -242,11 +242,25 @@ def get_msillm_identifier(cfg: DictConfig) -> str:
     repo_name = repo_name.replace("/", "_").replace(":", "_")
     entrypoint = entrypoint.replace("/", "_").replace(":", "_")
     
-    # Add gripper compression status to identifier to distinguish save directories
+    # Add compression status to identifier to distinguish save directories
     compress_gripper = msillm_cfg.get("compress_gripper", True)
-    gripper_suffix = "" if compress_gripper else "_static_only"
+    compress_rgb = msillm_cfg.get("compress_rgb", True)
     
-    return f"msillm-{repo_name}-{entrypoint}{gripper_suffix}"
+    # Determine suffix based on compression settings
+    if compress_gripper and not compress_rgb:
+        # Only gripper compressed -> gripper_only
+        compression_suffix = "_gripper_only"
+    elif not compress_gripper and compress_rgb:
+        # Only rgb_static compressed -> static_only
+        compression_suffix = "_static_only"
+    elif compress_gripper and compress_rgb:
+        # Both compressed -> no suffix
+        compression_suffix = ""
+    else:
+        # Neither compressed -> no suffix (default case)
+        compression_suffix = ""
+    
+    return f"msillm-{repo_name}-{entrypoint}{compression_suffix}"
 
 def extract_msillm_identifier_from_checkpoint_path(checkpoint_path: Path) -> Optional[str]:
     """
