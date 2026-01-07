@@ -132,78 +132,6 @@ def _freeze_all_except_vision_encoders(model: LightningModule) -> None:
     gripper_resnet = getattr(model, "gripper_resnet", None)
     _set_requires_grad(gripper_resnet, True)
 
-def _freeze_compression_encoder_only_train_decoder(compression_model: torch.nn.Module) -> Optional[torch.nn.Module]:
-    """
-    Freeze everything in compression model, then unfreeze decoder only.
-    Returns the decoder module if found.
-    """
-    _set_requires_grad(compression_model, False)
-    _enc, dec = extract_compression_modules(compression_model)
-    _set_requires_grad(dec, True)
-    return dec
-
-class ImageCompressionTransform:
-    """
-    Lightweight transform that routes images through MS-ILLM compression model.
-    For training, uses forward method to get output.image (same as training loop).
-    Intended to mirror Phase 1 (image compression) so Phase 2 sees reconstructed images.
-    """
-    def __init__(
-        self,
-        compression_model: torch.nn.Module,
-        device: str = "cpu",
-    ):
-        self.compression_model = compression_model.eval()
-        self.device = torch.device(device)
-
-    @torch.no_grad()
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Expects x in shape (T, C, H, W) or (C, H, W).
-        Returns a reconstructed tensor on CPU for downstream transforms.
-        Uses forward method to get output.image (same as training).
-        """
-        original_shape = x.shape
-        is_uint8 = x.dtype == torch.uint8
-        x = x.to(self.device)
-        if is_uint8:
-            x = x.float() / 255.0
-
-        if x.dim() == 3:
-            x = x.unsqueeze(0)
-
-        batch_size = x.shape[0]
-        x_flat = x.reshape(-1, *x.shape[-3:])  # Flatten to (B*T, C, H, W) if needed
-
-        # Use forward method to get output.image (same as training loop)
-        output = self.compression_model(x_flat)
-        if hasattr(output, 'image'):
-            recon = output.image.clamp(0.0, 1.0)
-        elif hasattr(output, 'x_hat'):
-            recon = output.x_hat.clamp(0.0, 1.0)
-        else:
-            # If output is just a tensor
-            recon = output.clamp(0.0, 1.0) if isinstance(output, torch.Tensor) else x_flat
-
-        # Reshape back to original batch structure
-        if recon.shape[0] != batch_size:
-            recon = recon.reshape(batch_size, *recon.shape[1:])
-
-        # Best-effort reshape in case dimensions don't match
-        if recon.shape != x.shape and recon.numel() == x.numel():
-            recon = recon.view_as(x)
-
-        if original_shape == recon.shape[1:]:
-            recon = recon.squeeze(0)
-        elif original_shape == recon.shape:
-            pass  # Already correct shape
-        else:
-            # Try to match original shape
-            recon = recon.reshape(original_shape) if recon.numel() == x.numel() else recon
-        
-        recon = recon.float().clamp(0, 1).cpu()
-        return recon
-
 def clear_cuda_cache():
     """Clear CUDA cache and garbage collect unused memory."""
     if torch.cuda.is_available():
@@ -600,41 +528,6 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
     # type: ignore[method-assign]
     model.embed_visual_obs = types.MethodType(_patched, model)
     return decoder
-
-def attach_compression_to_datamodule(datamodule, compression_model: Optional[torch.nn.Module], compression_cfg: Optional[DictConfig]) -> None:
-    """
-    Prepend the image compression transform to datamodule transforms so Phase 2
-    consumes reconstructed images. Uses compression_model's compress/decompress or forward method.
-    """
-    if compression_model is None or not hasattr(datamodule, "transforms") or datamodule.transforms is None:
-        return
-
-    device = "cpu"
-    if compression_cfg and "inference_device" in compression_cfg:
-        device = compression_cfg.inference_device
-    
-    # Check if compression is enabled for each sensor
-    compress_gripper = compression_cfg.get("compress_gripper", True) if compression_cfg else True
-    compress_rgb = compression_cfg.get("compress_rgb", True) if compression_cfg else True
-
-    # If transforms are still configs, instantiate them so we can prepend callables.
-    datamodule.transforms = hydra.utils.instantiate(datamodule.transforms)
-
-    # Use the full compression model with forward method (same as training)
-    transform = ImageCompressionTransform(compression_model=compression_model, device=device)
-    for split in ("train", "val"):
-        if split not in datamodule.transforms:
-            continue
-        # Apply compression transform to static image only if enabled
-        if compress_rgb and "rgb_static" in datamodule.transforms[split]:
-            datamodule.transforms[split]["rgb_static"] = [transform] + list(datamodule.transforms[split]["rgb_static"])
-        
-        # Apply compression transform to gripper image only if enabled
-        if compress_gripper and "rgb_gripper" in datamodule.transforms[split]:
-            datamodule.transforms[split]["rgb_gripper"] = [transform] + list(datamodule.transforms[split]["rgb_gripper"])
-    
-    log_rank_0(f"Injected image compression transform into datamodule transforms (static={'yes' if compress_rgb else 'no'}, gripper={'yes' if compress_gripper else 'no'}).")
-
 
 @hydra.main(config_path="../conf", config_name="config_libero_msillm")
 def train(cfg: DictConfig) -> None:
