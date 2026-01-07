@@ -257,8 +257,8 @@ def get_msillm_identifier(cfg: DictConfig) -> str:
         # Both compressed -> no suffix
         compression_suffix = ""
     else:
-        # Neither compressed -> no suffix (default case)
-        compression_suffix = ""
+        # Neither compressed -> _none suffix to distinguish from both=True case
+        compression_suffix = "_none"
     
     return f"msillm-{repo_name}-{entrypoint}{compression_suffix}"
 
@@ -465,7 +465,7 @@ def _clip_mean_std(device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tens
     std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device, dtype=dtype).view(1, 1, 3, 1, 1)
     return mean, std
 
-def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress_gripper: bool = True) -> Optional[torch.nn.Module]:
+def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress_gripper: bool = True, compress_rgb: bool = True) -> Optional[torch.nn.Module]:
     """
     Patch `MoDEAgent.embed_visual_obs` at runtime to:
       normalized -> unnormalize to [0,1] -> encode(no_grad) -> decode(with grad) -> renormalize
@@ -473,6 +473,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
     Args:
         model: LightningModule to patch
         compress_gripper: If True, apply reconstruction to gripper image as well. If False, only static image.
+        compress_rgb: If True, apply reconstruction to rgb_static image. If False, skip compression for static image.
 
     Returns the decoder module if patch applied, else None.
     """
@@ -528,33 +529,37 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
         # encoder -> hyper_analysis -> hyper_bottleneck -> hyper_synthesis -> latent_bottleneck -> decoder
         # All steps except decoder should be no_grad to ensure only decoder trains
         # IMPORTANT: Explicitly delete intermediate tensors to save memory (especially when compress_gripper=True)
-        with torch.no_grad():
-            # Step 1: Encode image to latent (same as msillm.forward line 498)
-            latent = encoder(x01_bt_resized)
-            # Delete input after encoding to free memory
-            del x01_bt_resized
-            
-            # Step 2: Hyperprior analysis (same as msillm.forward line 501)
-            hyper_latent = msillm.hyper_analysis(latent)
-            hyper_latent, _ = msillm.hyper_bottleneck(hyper_latent)
-            
-            # Step 3: Hyperprior synthesis (mean and scale) (same as msillm.forward lines 507-508)
-            means = msillm.hyper_synthesis_mean(hyper_latent)
-            scales = msillm.hyper_synthesis_scale(hyper_latent)
-            
-            # Delete hyper_latent to free memory (no longer needed after synthesis)
-            del hyper_latent
-            
-            # Step 4: Latent bottleneck (quantization) (same as msillm.forward line 509-510)
-            quantized_latents, _ = msillm.latent_bottleneck(latent, scales, means=means)
-            
-            # Delete intermediate tensors to free memory (only quantized_latent is needed)
-            del latent, means, scales
-            
-            # Step 5: Use quantized latents (same as msillm.forward line 521 for eval mode)
-            # Note: We use quantized_latents (not STE) since encoder/intermediate steps are frozen
-            quantized_latent = quantized_latents
-            del quantized_latents  # Free memory, only quantized_latent is needed
+        #with torch.no_grad():
+        # Step 1: Encode image to latent (same as msillm.forward line 498)
+        latent = encoder(x01_bt_resized)
+        # Delete input after encoding to free memory
+        del x01_bt_resized
+        
+        # Step 2: Hyperprior analysis (same as msillm.forward line 501)
+        hyper_latent = msillm.hyper_analysis(latent)
+        hyper_latent, _ = msillm.hyper_bottleneck(hyper_latent)
+        
+        # Step 3: Hyperprior synthesis (mean and scale) (same as msillm.forward lines 507-508)
+        means = msillm.hyper_synthesis_mean(hyper_latent)
+        scales = msillm.hyper_synthesis_scale(hyper_latent)
+        
+        # Delete hyper_latent to free memory (no longer needed after synthesis)
+        del hyper_latent
+        
+        # Step 4: Latent bottleneck (quantization) (same as msillm.forward line 509-510)
+        quantized_latents, _ = msillm.latent_bottleneck(latent, scales, means=means)
+        
+        # Delete intermediate tensors to free memory (only quantized_latent is needed)
+        del latent, means, scales
+        
+        # Step 5: Use quantized latents (same as msillm.forward line 521 for eval mode)
+        # Note: We use quantized_latents (not STE) since encoder/intermediate steps are frozen
+        quantized_latent = quantized_latents
+        del quantized_latents  # Free memory, only quantized_latent is needed
+        
+        # CRITICAL: Detach quantized_latent to break gradient flow from encoder (which is frozen)
+        # but allow decoder gradients to flow. This prevents the "does not require grad" error.
+        #quantized_latent = quantized_latent.detach()
         
         # Step 6: Decode (WITH gradients - this is what we're training) (same as msillm.forward line 524)
         recon_resized = decoder(quantized_latent)
@@ -573,7 +578,13 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
 
     def _patched(self, rgb_static, rgb_gripper, latent_goal):  # type: ignore
         # Apply MS-ILLM reconstruction so decoder gradients flow.
-        rgb_static = _reconstruct_normed(rgb_static)
+        # Only reconstruct rgb_static if configured
+        if compress_rgb:
+            rgb_static = _reconstruct_normed(rgb_static)
+        else:
+            # Normalize static image even when not compressing (inputs are in [0, 1] range)
+            mean, std = _clip_mean_std(rgb_static.device, rgb_static.dtype)
+            rgb_static = (rgb_static - mean) / std
         
         # Only reconstruct gripper if configured
         if compress_gripper:
@@ -602,8 +613,9 @@ def attach_compression_to_datamodule(datamodule, compression_model: Optional[tor
     if compression_cfg and "inference_device" in compression_cfg:
         device = compression_cfg.inference_device
     
-    # Check if gripper compression is enabled
+    # Check if compression is enabled for each sensor
     compress_gripper = compression_cfg.get("compress_gripper", True) if compression_cfg else True
+    compress_rgb = compression_cfg.get("compress_rgb", True) if compression_cfg else True
 
     # If transforms are still configs, instantiate them so we can prepend callables.
     datamodule.transforms = hydra.utils.instantiate(datamodule.transforms)
@@ -613,15 +625,15 @@ def attach_compression_to_datamodule(datamodule, compression_model: Optional[tor
     for split in ("train", "val"):
         if split not in datamodule.transforms:
             continue
-        # Apply compression transform to static image
-        if "rgb_static" in datamodule.transforms[split]:
+        # Apply compression transform to static image only if enabled
+        if compress_rgb and "rgb_static" in datamodule.transforms[split]:
             datamodule.transforms[split]["rgb_static"] = [transform] + list(datamodule.transforms[split]["rgb_static"])
         
         # Apply compression transform to gripper image only if enabled
         if compress_gripper and "rgb_gripper" in datamodule.transforms[split]:
             datamodule.transforms[split]["rgb_gripper"] = [transform] + list(datamodule.transforms[split]["rgb_gripper"])
     
-    log_rank_0(f"Injected image compression transform into datamodule transforms (static={'yes'}, gripper={'yes' if compress_gripper else 'no'}).")
+    log_rank_0(f"Injected image compression transform into datamodule transforms (static={'yes' if compress_rgb else 'no'}, gripper={'yes' if compress_gripper else 'no'}).")
 
 
 @hydra.main(config_path="../conf", config_name="config_libero_msillm")
@@ -719,28 +731,41 @@ def train(cfg: DictConfig) -> None:
             log_rank_0("All model parameters are frozen")
 
         # Configure MS-ILLM encoder/decoder training
+        # 1. train_msillm_encoder=True, train_msillm_decoder=False: decoder 제외 모두 학습 가능
+        # 2. train_msillm_encoder=False, train_msillm_decoder=True: decoder만 학습 가능
+        # 3. train_msillm_encoder=True, train_msillm_decoder=True: 모두 학습 가능
+        # Note: MS-ILLM parameters are not in configure_optimizers by default, so we need to add them explicitly
         compression_decoder = None
         if msillm_model is not None:
+            # Step 1: Freeze all MS-ILLM parameters first
+            _set_requires_grad(msillm_model, False)
+            
+            # Step 2: Unfreeze all if encoder training is enabled
+            if train_msillm_encoder:
+                _set_requires_grad(msillm_model, True)
+            
+            # Step 3: Set decoder based on train_msillm_decoder
             encoder, decoder = extract_compression_modules(msillm_model)
-            
-            # Freeze/unfreeze MS-ILLM encoder
-            if encoder is not None:
-                _set_requires_grad(encoder, train_msillm_encoder)
-                log_rank_0(f"MS-ILLM encoder: {'trainable' if train_msillm_encoder else 'frozen'}")
-            
-            # Freeze/unfreeze MS-ILLM decoder
             if decoder is not None:
                 _set_requires_grad(decoder, train_msillm_decoder)
                 compression_decoder = decoder if train_msillm_decoder else None
-                log_rank_0(f"MS-ILLM decoder: {'trainable' if train_msillm_decoder else 'frozen'}")
             
-            # If decoder is trainable, add it to optimizer
-            if compression_decoder is not None:
+            # Step 4: Add trainable MS-ILLM parameters to optimizer
+            # If encoder training is enabled, add all MS-ILLM (decoder will be filtered if frozen)
+            # If only decoder training, add decoder only
+            if train_msillm_encoder:
+                # Add entire MS-ILLM model (decoder will be filtered out if frozen by _patch_optimizer_to_only_train_selected)
+                _patch_optimizer_to_only_train_selected(model, extra_trainable_module=msillm_model)
+            elif compression_decoder is not None:
+                # Only decoder is trainable, add decoder only
                 _patch_optimizer_to_only_train_selected(model, extra_trainable_module=compression_decoder)
+            
+            log_rank_0(f"MS-ILLM: encoder={train_msillm_encoder}, decoder={train_msillm_decoder}")
 
         # Patch embed_visual_obs to route images through MS-ILLM encoder(no_grad)/decoder(grad) in forward.
         compress_gripper = cfg.msillm.get("compress_gripper", True) if "msillm" in cfg else True
-        patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper)
+        compress_rgb = cfg.msillm.get("compress_rgb", True) if "msillm" in cfg else True
+        patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper, compress_rgb=compress_rgb)
         
         # Load pretrained weights if configured
         if "pretrain_chk" in cfg:

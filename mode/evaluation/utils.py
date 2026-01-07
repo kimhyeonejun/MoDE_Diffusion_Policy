@@ -498,7 +498,7 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     recon_frame = recon[0] if recon.dim() == 4 else recon.squeeze(0)
     return recon_frame
 
-def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = True, skip_resize: bool = False):
+def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = True, compress_rgb: bool = True, skip_resize: bool = False):
     msillm = getattr(model, "msillm_model", None)
     if msillm is None:
         return None
@@ -571,7 +571,14 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
         return out, recon  # Return both normalized and denormalized tensors
 
     def _patched(self, rgb_static, rgb_gripper, latent_goal):
-        rgb_static_recon, rgb_static_recon_denorm = _reconstruct_normed(rgb_static, sensor_name="rgb_static")
+        # Only reconstruct rgb_static if configured
+        if compress_rgb:
+            rgb_static_recon, rgb_static_recon_denorm = _reconstruct_normed(rgb_static, sensor_name="rgb_static")
+        else:
+            # Normalize static image even when not compressing (inputs are in [0, 1] range)
+            mean, std = _clip_mean_std(rgb_static.device, rgb_static.dtype)
+            rgb_static_recon = (rgb_static - mean) / std
+            rgb_static_recon_denorm = None  # Use original env image (224x224) when not compressing
         
         # Only reconstruct gripper if configured
         if compress_gripper:
@@ -585,7 +592,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = 
         # Store reconstructed frames for video if enabled
         if hasattr(self, '_store_reconstructed_frame') and self._store_reconstructed_frame:
             # Extract single frame: [C, H, W] from [B, T, C, H, W]
-            if rgb_static_recon_denorm is not None:
+            if compress_rgb and rgb_static_recon_denorm is not None:
                 static_frame = rgb_static_recon_denorm[0, 0] if rgb_static_recon_denorm.dim() == 5 else rgb_static_recon_denorm[0]
                 self._last_reconstructed_frame_tensor_rgb_static = static_frame
             
@@ -726,12 +733,13 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
                 print("Loaded regular weights")
     
     # Patch MS-ILLM and move to device
-    # Get compress_gripper setting from config (default to True for backward compatibility)
+    # Get compression settings from config (default to True for backward compatibility)
     compress_gripper = OmegaConf.select(cfg, "msillm.compress_gripper", default=True)
+    compress_rgb = OmegaConf.select(cfg, "msillm.compress_rgb", default=True)
     # Skip resize when using Hugging Face repo checkpoint (no local checkpoint file)
     skip_resize = is_hf_repo
-    patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper, skip_resize=skip_resize)
-    print(f"[MS-ILLM] compress_gripper={compress_gripper}, skip_resize={skip_resize}")
+    patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper, compress_rgb=compress_rgb, skip_resize=skip_resize)
+    print(f"[MS-ILLM] compress_gripper={compress_gripper}, compress_rgb={compress_rgb}, skip_resize={skip_resize}")
     model.freeze()
     model = move_model_to_device(model, device)
     
