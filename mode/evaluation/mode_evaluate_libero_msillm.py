@@ -82,9 +82,11 @@ def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_stati
         tensor_attr = f'_last_reconstructed_frame_tensor_{sensor_name}'
         if hasattr(model, tensor_attr):
             recon_frame = getattr(model, tensor_attr)
-        rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-        rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
-        return rgb_recon_np[..., ::-1]  # RGB to BGR
+            if recon_frame is not None:
+                rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
+                return rgb_recon_np[..., ::-1]  # RGB to BGR
+        # If reconstructed frame is not available (e.g., compress_rgb=False), fall through to use data/obs
     
     # Use transforms-processed image if available (already in [0, 1] range, no denormalize needed)
     if data is not None and sensor_name in data.get("rgb_obs", {}):
