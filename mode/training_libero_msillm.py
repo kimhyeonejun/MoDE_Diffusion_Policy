@@ -4,8 +4,6 @@ import sys
 sys.tracebacklimit = None
 import os 
 from typing import Optional, Tuple
-import json
-import time
 import wandb
 import hydra
 from omegaconf import DictConfig
@@ -59,17 +57,6 @@ def _count_params(module: Optional[torch.nn.Module]) -> tuple[int, int]:
         if p.requires_grad:
             trainable += n
     return total, trainable
-
-def _first_trainable_param_names(module: Optional[torch.nn.Module], max_items: int = 20) -> list[str]:
-    if module is None:
-        return []
-    names: list[str] = []
-    for n, p in module.named_parameters():
-        if p.requires_grad:
-            names.append(n)
-            if len(names) >= max_items:
-                break
-    return names
 
 def _patch_optimizer_to_only_train_selected(
     model: LightningModule,
