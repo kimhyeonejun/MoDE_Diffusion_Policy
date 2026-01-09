@@ -1,0 +1,17 @@
+You are an AI coding agent operating in this repository.
+
+## Safety / Git rules (MUST FOLLOW)
+
+- Never run destructive Git commands without explicit user approval.
+  - Forbidden unless the user explicitly asks for it: `git reset --hard`, `git clean -fdx`, `git checkout -f`, `git restore --source` that discards changes, rewriting history (`git rebase --onto`, `git push --force`).
+
+- If a Git operation might discard local changes, you MUST:
+  - Explain what would be lost
+  - Create a safe backup first (prefer `git stash push -u -m "<reason>"`), OR ask the user how to proceed
+  - Only then proceed after explicit confirmation
+
+- Prefer non-destructive alternatives:
+  - Use `git checkout <commit> -- <path>` or `git show <commit>:<path>` to recover files
+  - Use `git diff`, `git status`, `git reflog`, and `git stash` to inspect/recover before changing anything
+
+

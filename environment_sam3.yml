@@ -1,4 +1,4 @@
-name: sam3
+name: mode_sam
 channels:
   - conda-forge
   - defaults
@@ -160,11 +160,10 @@ dependencies:
     - timm==1.0.24
     - tokenizers==0.22.2
     - tomli==2.3.0
-    - torch==2.7.0+cu126
+    # PyTorch with CUDA - install separately after env creation:
+    # pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu126
     - torch-geometric==2.7.0
-    - torchaudio==2.7.0+cu126
     - torchmetrics==1.8.2
-    - torchvision==0.22.0+cu126
     - tqdm==4.67.1
     - transformers==4.57.3
     - triton==3.3.0
@@ -174,4 +173,4 @@ dependencies:
     - xxhash==3.6.0
     - yacs==0.1.8
     - yarl==1.22.0
-prefix: /home/hjkim/.conda/envs/sam3
+prefix: /home/khj20343/.conda/envs/mode_sam
