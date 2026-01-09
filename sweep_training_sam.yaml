@@ -1,0 +1,25 @@
+program: mode/training_libero_msillm_sam.py
+method: grid
+metric:
+  goal: minimize
+  name: val_act/lang_act_loss_pp
+
+parameters:
+  # SAM3 alpha hyperparameter search
+  custom_loss.sam3_alpha:
+    values: [0.5, 1.0, 1.5, 2.0, 3.0]
+  # Optional: also search other SAM3 parameters
+  # custom_loss.sam3_view:
+  #   values: ["static", "gripper", "both"]
+  # custom_loss.sam3_confidence_threshold:
+  #   values: [0.01, 0.05, 0.10]
+  # Base config to use
+  config_name:
+    value: config_libero_msillm_sam
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - --config-name=${config_name}
+  - ${args_no_hyphens}
