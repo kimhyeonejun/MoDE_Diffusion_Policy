@@ -467,7 +467,6 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     
     # Check if resize should be skipped (e.g., when using Hugging Face repo checkpoint)
     skip_resize = getattr(model, "_skip_resize_for_reconstruction", False)
-    resize_needed = False
     if skip_resize:
         # Skip resize, use original size directly
         x01_bt_resized = x01_bt
@@ -478,18 +477,16 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
             new_h = ((h + factor - 1) // factor) * factor
             new_w = ((w + factor - 1) // factor) * factor
             x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
-            resize_needed = True
         else:
             x01_bt_resized = x01_bt
-            resize_needed = False
     
     # Compress/Decompress (this triggers LatentCaptureWrapper if present)
     with torch.no_grad():
         compressed = msillm.compress(x01_bt_resized, force_cpu=False)
         recon_resized = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
     
-    # Resize back to original size if needed
-    if resize_needed:
+    # Resize back to original size if resize was done
+    if recon_resized.shape[2:] != (h, w):
         recon = F.interpolate(recon_resized, size=(h, w), mode='bilinear', align_corners=False)
     else:
         recon = recon_resized
@@ -736,7 +733,7 @@ def get_msillm_mode_and_env(train_folder, dataset_path, checkpoint, env=None, la
     # Get compression settings from config (default to True for backward compatibility)
     compress_gripper = OmegaConf.select(cfg, "msillm.compress_gripper", default=True)
     compress_rgb = OmegaConf.select(cfg, "msillm.compress_rgb", default=True)
-    # Skip resize when using Hugging Face repo checkpoint (no local checkpoint file)
+    # Always resize to 64's multiple for MS-ILLM compression (required for consistency)
     skip_resize = is_hf_repo
     patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper=compress_gripper, compress_rgb=compress_rgb, skip_resize=skip_resize)
     print(f"[MS-ILLM] compress_gripper={compress_gripper}, compress_rgb={compress_rgb}, skip_resize={skip_resize}")
