@@ -1,3 +1,5 @@
+project: mode-libero-msillm-sam
+entity: goodi20343-korea-advanced-institute-of-science-and-techn
 program: mode/training_libero_msillm_sam.py
 method: grid
 metric:
@@ -6,20 +8,37 @@ metric:
 
 parameters:
   # SAM3 alpha hyperparameter search
-  custom_loss.sam3_alpha:
-    values: [0.5, 1.0, 1.5, 2.0, 3.0]
+  #custom_loss.sam3_alpha:
+  #  values: [0.5, 1.0, 1.5, 2.0, 3.0]
   # Optional: also search other SAM3 parameters
-  # custom_loss.sam3_view:
-  #   values: ["static", "gripper", "both"]
+  custom_loss.sam3_view:
+     values: ["both","static", "gripper"]
+    
   # custom_loss.sam3_confidence_threshold:
   #   values: [0.01, 0.05, 0.10]
-  # Base config to use
-  config_name:
-    value: config_libero_msillm_sam
+  
+  # MS-ILLM compression parameters
+  msillm.compress_gripper:
+     values: [true, false]
+  msillm.compress_rgb:
+     values: [true, false]
+  
+  # MS-ILLM entrypoint (quality) parameter
+  # msillm.entrypoint:
+  #   values: ["msillm_quality_vlo1", "msillm_quality_vlo2", "msillm_quality_1"]
+  
+  # Training configuration parameters
+  # train_vision_encoders:
+  #   values: [true, false]
+  # train_msillm_encoder:
+  #   values: [true, false]
+  # train_msillm_decoder:
+  #   values: [true, false]
 
 command:
   - ${env}
   - python
   - ${program}
-  - --config-name=${config_name}
+  - --config-name=config_libero_msillm_sam
+  - logger.project=mode-libero-msillm-sam
   - ${args_no_hyphens}

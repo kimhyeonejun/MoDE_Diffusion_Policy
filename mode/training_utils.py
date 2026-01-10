@@ -36,7 +36,7 @@ def patch_on_before_zero_grad_for_msillm(model: LightningModule) -> None:
     if orig_on_before_zero_grad is None or not callable(orig_on_before_zero_grad):
         return
     
-    def _patched_on_before_zero_grad(optimizer=None):  # type: ignore
+    def _patched_on_before_zero_grad(self, optimizer=None):  # type: ignore
         """
         Extended gradient monitoring and logging for wrapped model with inner model, blocks, layers, and MS-ILLM decoder.
         """
@@ -45,7 +45,7 @@ def patch_on_before_zero_grad_for_msillm(model: LightningModule) -> None:
         grad_stats = {'mean': [], 'median': [], 'max': [], 'min': []}
         
         # Compute grad norms for inner_model (original logic)
-        for name, p in model.model.inner_model.named_parameters():
+        for name, p in self.model.inner_model.named_parameters():
             if p.grad is not None:
                 # Calculate total grad norm
                 param_norm = p.grad.norm().item()
@@ -76,7 +76,7 @@ def patch_on_before_zero_grad_for_msillm(model: LightningModule) -> None:
         
         # Additionally compute grad norm for MS-ILLM decoder if present and trainable
         msillm_decoder_grad_norm_sq = 0.0
-        msillm_model = getattr(model, "msillm_model", None)
+        msillm_model = getattr(self, "msillm_model", None)
         if msillm_model is not None:
             decoder = getattr(msillm_model, "decoder", None)
             if decoder is not None:
@@ -99,19 +99,19 @@ def patch_on_before_zero_grad_for_msillm(model: LightningModule) -> None:
                 layer_grad_norms['blocks'][block][layer] = norm ** 0.5
         
         # Log total grad norm (now includes MS-ILLM decoder)
-        model.log("debug/total_grad_norm", total_grad_norm, on_step=True, on_epoch=False, sync_dist=True)
+        self.log("debug/total_grad_norm", total_grad_norm, on_step=True, on_epoch=False, sync_dist=True)
         
         # Log input layers grad norm
-        model.log("debug/input_layers_grad_norm", layer_grad_norms['input_layers'], on_step=True, on_epoch=False, sync_dist=True)
+        self.log("debug/input_layers_grad_norm", layer_grad_norms['input_layers'], on_step=True, on_epoch=False, sync_dist=True)
         
         # Log MS-ILLM decoder grad norm separately for debugging
         if msillm_decoder_grad_norm > 0:
-            model.log("debug/msillm_decoder_grad_norm", msillm_decoder_grad_norm, on_step=True, on_epoch=False, sync_dist=True)
+            self.log("debug/msillm_decoder_grad_norm", msillm_decoder_grad_norm, on_step=True, on_epoch=False, sync_dist=True)
         
         # Log block and layer-wise grad norms
         for block, layers in layer_grad_norms['blocks'].items():
             for layer, norm in layers.items():
-                model.log(f"debug/block_{block}_{layer}_grad_norm", norm, on_step=True, on_epoch=False, sync_dist=True)
+                self.log(f"debug/block_{block}_{layer}_grad_norm", norm, on_step=True, on_epoch=False, sync_dist=True)
     
     # type: ignore[method-assign]
     model.on_before_zero_grad = types.MethodType(_patched_on_before_zero_grad, model)

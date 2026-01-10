@@ -244,7 +244,6 @@ class EvaluateLibero:
         self.cfg.policy.language_encoder.network_kwargs = OmegaConf.create()
 
         # Create task embeddings - same as training: use get_task_embs
-        import torch
         num_tasks = len(self.descriptions)
         
         # Use get_task_embs same as training (libero_dataset.py line 147)
@@ -287,7 +286,7 @@ class EvaluateLibero:
             if isinstance(lang_text, str):
                 goal['lang_text'] = [lang_text]
             else:
-                goal['lang_text'] = lang_text
+        goal['lang_text'] = lang_text
         else:
             goal['lang_text'] = None
         goal['lang'] = lang_embed
