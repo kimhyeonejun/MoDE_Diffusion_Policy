@@ -25,7 +25,7 @@ seed: 242
 # Resume from specific checkpoint (optional)
 resume_from_checkpoint: null  # Set to path like: saved_models/msillm-xxx_epoch=epoch=19.ckpt
 device: 'cuda'
-batch_size: 32 # 38 # 128
+batch_size: 256 # 38 # 128
 # Number of GPU devices to use (passed through to `trainer.devices` below).
 devices: 1
 goal_window_size: 1
