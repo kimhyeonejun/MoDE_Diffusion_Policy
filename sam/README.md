@@ -1,4 +1,4 @@
-### `sam/grounded/` (from `grounded_sam.ipynb`)
+### `sam/utils/` (from `grounded_sam.ipynb`)
 
 This folder contains small reusable modules extracted from `sam/grounded_sam.ipynb`:
 

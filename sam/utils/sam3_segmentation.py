@@ -28,6 +28,7 @@ def segment_with_sam3_text_prompts(
     prompts: Sequence[str],
     thresholds: Sequence[float],
     label: str = "image",
+    silent: bool = False,
 ) -> Dict[str, Any]:
     """
     Run SAM3 text-prompt segmentation for multiple prompts and thresholds.
@@ -36,14 +37,24 @@ def segment_with_sam3_text_prompts(
     - For each prompt, try multiple thresholds; keep the best result per prompt
       (prefers higher threshold then more masks).
     - Combine masks/boxes/scores across prompts.
+    
+    Args:
+        sam3_processor: SAM3Processor instance
+        image_pil: PIL Image to segment
+        prompts: Sequence of text prompts
+        thresholds: Sequence of confidence thresholds to try
+        label: Label for logging (default: "image")
+        silent: If True, suppress print output (default: False)
     """
     state = sam3_processor.set_image(image_pil)
-    print(f"✓ {label}: image set")
+    if not silent:
+        print(f"✓ {label}: image set")
 
     all_results: List[dict] = []
 
     for pi, prompt in enumerate(prompts):
-        print(f"\n  [{pi+1}/{len(prompts)}] Trying prompt: {prompt!r}")
+        if not silent:
+            print(f"\n  [{pi+1}/{len(prompts)}] Trying prompt: {prompt!r}")
         prompt_results: List[dict] = []
 
         for thr in thresholds:
@@ -55,10 +66,11 @@ def segment_with_sam3_text_prompts(
                 scores = out["scores"]
                 smin = scores.min().item() if isinstance(scores, torch.Tensor) else float(np.min(scores))
                 smax = scores.max().item() if isinstance(scores, torch.Tensor) else float(np.max(scores))
-                print(
-                    f"    ✓ threshold={sam3_processor.confidence_threshold:.2f}: {n} masks "
-                    f"(score range: [{smin:.3f}, {smax:.3f}])"
-                )
+                if not silent:
+                    print(
+                        f"    ✓ threshold={sam3_processor.confidence_threshold:.2f}: {n} masks "
+                        f"(score range: [{smin:.3f}, {smax:.3f}])"
+                    )
                 prompt_results.append(
                     {
                         "threshold": sam3_processor.confidence_threshold,
@@ -69,21 +81,25 @@ def segment_with_sam3_text_prompts(
                     }
                 )
             else:
-                print(f"    ✗ threshold={sam3_processor.confidence_threshold:.2f}: 0 masks")
+                if not silent:
+                    print(f"    ✗ threshold={sam3_processor.confidence_threshold:.2f}: 0 masks")
 
         if prompt_results:
             best_for_prompt = max(prompt_results, key=lambda x: (x["threshold"], x["num_masks"]))
             best_for_prompt["prompt"] = prompt
             all_results.append(best_for_prompt)
-            print(
-                f"    → Selected: threshold={best_for_prompt['threshold']:.2f}, "
-                f"{best_for_prompt['num_masks']} masks\n"
-            )
+            if not silent:
+                print(
+                    f"    → Selected: threshold={best_for_prompt['threshold']:.2f}, "
+                    f"{best_for_prompt['num_masks']} masks\n"
+                )
         else:
-            print("    → No detections for this prompt\n")
+            if not silent:
+                print("    → No detections for this prompt\n")
 
     if not all_results:
-        print("  Summary: No detections for any prompt")
+        if not silent:
+            print("  Summary: No detections for any prompt")
         device = torch.device(getattr(sam3_processor, "device", "cpu"))
         return {
             "masks": torch.empty((0, 1, 1, 1), device=device, dtype=torch.bool),
@@ -92,7 +108,8 @@ def segment_with_sam3_text_prompts(
             "prompt_results": [],
         }
 
-    print(f"  Summary: Found results for {len(all_results)}/{len(prompts)} prompts")
+    if not silent:
+        print(f"  Summary: Found results for {len(all_results)}/{len(prompts)} prompts")
 
     combined_masks = []
     combined_boxes = []
