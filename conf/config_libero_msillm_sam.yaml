@@ -115,7 +115,7 @@ logger:
   name: logger
   group: mode
   log_model: false
-  project: mode-libero-msillm-sam  # Changed from ${libero_benchmark} to match sweep project
+  project: libero_10  # Changed from ${libero_benchmark} to match sweep project
   # Prefer environment variables; training script also overwrites group/name/id for uniqueness.
   entity: ${oc.env:WANDB_ENTITY,null}
   id: ${oc.env:WANDB_RUN_ID,null}

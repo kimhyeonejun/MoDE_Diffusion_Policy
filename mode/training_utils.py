@@ -1,7 +1,10 @@
 """
 Training utility functions for MS-ILLM integration.
 """
+import hashlib
 import logging
+import os
+import time
 import types
 from pathlib import Path
 from typing import Optional, Tuple
@@ -341,18 +344,24 @@ def setup_logger(cfg: DictConfig, model: LightningModule):
         seed = cfg.get("seed", None)
         if msillm_info:
             cfg.logger.name = msillm_info
-            # Include seed in ID to make it unique and avoid conflicts
+            # Include seed in ID and add timestamp hash to make it unique and avoid conflicts
             # Only set ID if not already set by environment variable
             if cfg.logger.get("id") is None or cfg.logger.get("id") == "null":
                 base_id = msillm_info.replace("/", "_").replace(":", "_")
-                cfg.logger.id = f"{base_id}_seed{seed}" if seed is not None else base_id
+                seed_suffix = f"_seed{seed}" if seed is not None else ""
+                # Add timestamp hash to ensure uniqueness and avoid WandB 409 conflicts
+                timestamp_hash = hashlib.md5(f"{time.time()}_{os.getpid()}".encode()).hexdigest()[:8]
+                cfg.logger.id = f"{base_id}{seed_suffix}_{timestamp_hash}"
         else:
             base_name = f"{pathlib_cwd.parent.name}/{pathlib_cwd.name}"
             cfg.logger.name = base_name
             # Only set ID if not already set by environment variable
             if cfg.logger.get("id") is None or cfg.logger.get("id") == "null":
                 base_id = cfg.logger.name.replace("/", "_").replace(":", "_")
-                cfg.logger.id = f"{base_id}_seed{seed}" if seed is not None else base_id
+                seed_suffix = f"_seed{seed}" if seed is not None else ""
+                # Add timestamp hash to ensure uniqueness and avoid WandB 409 conflicts
+                timestamp_hash = hashlib.md5(f"{time.time()}_{os.getpid()}".encode()).hexdigest()[:8]
+                cfg.logger.id = f"{base_id}{seed_suffix}_{timestamp_hash}"
                 
     logger_instance = hydra.utils.instantiate(cfg.logger)
     
