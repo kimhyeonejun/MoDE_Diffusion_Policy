@@ -192,12 +192,10 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
     if isinstance(thresholds, (float, int)):
         thresholds = [float(thresholds)]
     thresholds = [float(t) for t in thresholds]
-    max_samples = cfg_get(cfg, "sam3_max_samples", None)  # Limit SAM3 processing for performance
-    if max_samples is not None:
-        max_samples = int(max_samples)
 
     # Extract lang_text from batch (use first sample's text for prompts)
     # Batch can be dict of datasets (train) or a single dataset batch (val-like)
+    
     if isinstance(batch, dict) and "rgb_obs" not in batch:
         # Multiple datasets: use first dataset's lang_text
         dataset_batch = list(batch.values())[0]
@@ -233,7 +231,6 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
             prompts,
             thresholds,
             alpha,
-            max_samples=max_samples,
         )
         diff = (pred - gt) * wm
         loss = (diff * diff).mean()
@@ -250,7 +247,6 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
             prompts,
             thresholds,
             alpha,
-            max_samples=max_samples,
         )
         diff = (pred - gt) * wm
         loss = (diff * diff).mean()
