@@ -37,7 +37,11 @@ if local_sam3_dir.exists():
 # Import prompt helper and SAM3 utilities from our modularized utils
 # Must be imported AFTER path setup
 from sam.utils.prompts import build_prompt_candidates
-from sam.utils.sam3_weight_map import get_sam3_processor, compute_weight_map
+from sam.utils.sam3_weight_map import (
+    get_sam3_processor,
+    compute_weight_map,
+    compute_weight_map_from_lang_text_batch,
+)
 
 from mode.utils.utils import get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
 from mode.training_utils import (
@@ -193,7 +197,7 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
         thresholds = [float(thresholds)]
     thresholds = [float(t) for t in thresholds]
 
-    # Extract lang_text from batch (use first sample's text for prompts)
+    # Extract lang_text from batch (per-sample) for SAM3 prompts.
     # Batch can be dict of datasets (train) or a single dataset batch (val-like)
     
     if isinstance(batch, dict) and "rgb_obs" not in batch:
@@ -203,14 +207,6 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
         dataset_batch = batch
     
     lang_text = dataset_batch.get("lang_text", None)
-    if isinstance(lang_text, (list, tuple)):
-        lang_text = lang_text[0] if len(lang_text) > 0 else ""
-    if torch.is_tensor(lang_text):
-        # Unlikely, but keep safe.
-        lang_text = ""
-    prompts = build_prompt_candidates(lang_text or "")
-    if not prompts:
-        prompts = ["object"]
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     sam3_processor = get_sam3_processor(device=device, logger=logger)
@@ -224,13 +220,8 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
     if view in ("static", "both") and "rgb_static_gt" in cache and "rgb_static_recon" in cache:
         gt = cache["rgb_static_gt"]
         pred = cache["rgb_static_recon"]
-        wm = compute_weight_map(
-            gt,
-            sam3_processor,
-            conf_thr,
-            prompts,
-            thresholds,
-            alpha,
+        wm = compute_weight_map_from_lang_text_batch(
+            gt, sam3_processor, conf_thr, lang_text, thresholds, alpha
         )
         diff = (pred - gt) * wm
         loss = (diff * diff).mean()
@@ -240,13 +231,8 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
     if view in ("gripper", "both") and "rgb_gripper_gt" in cache and "rgb_gripper_recon" in cache:
         gt = cache["rgb_gripper_gt"]
         pred = cache["rgb_gripper_recon"]
-        wm = compute_weight_map(
-            gt,
-            sam3_processor,
-            conf_thr,
-            prompts,
-            thresholds,
-            alpha,
+        wm = compute_weight_map_from_lang_text_batch(
+            gt, sam3_processor, conf_thr, lang_text, thresholds, alpha
         )
         diff = (pred - gt) * wm
         loss = (diff * diff).mean()
