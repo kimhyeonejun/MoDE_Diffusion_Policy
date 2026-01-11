@@ -10,9 +10,8 @@ from omegaconf import DictConfig
 import torch
 import torch.nn.functional as F
 import types
-from pytorch_lightning import Callback, LightningModule, seed_everything, Trainer
+from pytorch_lightning import LightningModule, seed_everything, Trainer
 from pytorch_lightning.callbacks import LearningRateMonitor
-from pytorch_lightning.utilities import rank_zero_only
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 import importlib
@@ -38,10 +37,8 @@ if local_sam3_dir.exists():
 # Import prompt helper and SAM3 utilities from our modularized utils
 # Must be imported AFTER path setup
 from sam.utils.prompts import build_prompt_candidates
-from sam.utils.sam3_segmentation import segment_with_sam3_text_prompts
-from sam.utils.sam3_weight_map import get_sam3_processor, tensor01_to_pil, compute_weight_map
+from sam.utils.sam3_weight_map import get_sam3_processor, compute_weight_map
 
-import mode.models.mode_agent as models_m
 from mode.utils.utils import get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
 from mode.training_utils import (
     patch_on_before_zero_grad_for_msillm,
@@ -417,13 +414,6 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
 @hydra.main(config_path="../conf", config_name="config_libero_msillm")
 def train(cfg: DictConfig) -> None:
     try:
-        # Setup environment
-        os.environ['HYDRA_FULL_ERROR'] = '1'
-        # Set memory allocation configuration
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-        # Fix for PyTorch 2.6+ weights_only issue: force weights_only=False for checkpoint loading
-        os.environ['TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD'] = '1'
-        
         seed_everything(cfg.seed, workers=True)
         torch.set_float32_matmul_precision('medium')
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -670,12 +660,14 @@ def train(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    # Set environment variables
+    # Set environment variables (keep in __main__ to avoid import side-effects when this file
+    # is imported as a module via `custom_loss.fn=...`).
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["TOKENIZERS_PARALLELISM"] = 'True'
+    os.environ["HYDRA_FULL_ERROR"] = "1"
+    # Fix for PyTorch 2.6+ weights_only issue: force weights_only=False for checkpoint loading
+    os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
-    # Add repo to path
-    sys.path.insert(0, str(Path(__file__).absolute().parents[1]))
     
     try:
         train()

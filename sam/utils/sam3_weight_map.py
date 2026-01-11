@@ -110,8 +110,10 @@ def compute_weight_map(
             m = union.squeeze(0).to(dtype=torch.float32, device=gt01_btchw.device)
         else:
             m = torch.zeros((h, w), dtype=torch.float32, device=gt01_btchw.device)
-        # Broadcast to (T,1,H,W) and store directly in pre-allocated tensor
-        weight_maps[bi] = (alpha * m).view(1, 1, h, w).expand(t, 1, h, w)
+        # Broadcast to (T,1,H,W) and store directly in pre-allocated tensor.
+        # Clamp so masked pixels are at most 1.0 (i.e., values >= 1 -> 1), while zeros stay zero.
+        wm = (alpha * m).clamp(0.0, 1.0)
+        weight_maps[bi] = wm.view(1, 1, h, w).expand(t, 1, h, w)
     
     # (B,T,1,H,W)
     return weight_maps
