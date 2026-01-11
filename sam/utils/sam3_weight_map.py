@@ -32,8 +32,17 @@ def get_sam3_processor(device: str | torch.device, logger=None):
     from sam3.model.sam3_image_processor import Sam3Processor  # type: ignore[import-not-found]
 
     # Default to a permissive threshold; we'll override per-call.
-    sam3_model = build_sam3_image_model(device=device, eval_mode=True)
-    _SAM3_LOSS_PROCESSOR = Sam3Processor(sam3_model, device=str(device), confidence_threshold=0.05)
+    #
+    # NOTE: sam3.model_builder._setup_device_and_mode() only checks `device == "cuda"` (string).
+    # If we pass a torch.device (or "cuda:0"), the model may stay on CPU -> CUDA input vs CPU weights crash.
+    if isinstance(device, torch.device):
+        device_str = "cuda" if device.type == "cuda" else "cpu"
+    else:
+        # Normalize "cuda:0" -> "cuda" for SAM3 internals
+        device_str = "cuda" if str(device).startswith("cuda") else "cpu"
+
+    sam3_model = build_sam3_image_model(device=device_str, eval_mode=True)
+    _SAM3_LOSS_PROCESSOR = Sam3Processor(sam3_model, device=device_str, confidence_threshold=0.05)
     if logger is not None:
         logger.info("[SAM3 recon loss] Initialized SAM3 processor")
     return _SAM3_LOSS_PROCESSOR
@@ -96,14 +105,29 @@ def compute_weight_map(
     # But we vectorize the mask processing and weight map creation
     # Use silent=True to suppress verbose output during training
     for bi in range(b):
-        out = segment_with_sam3_text_prompts(
-            sam3_processor,
-            img_pil_list[bi],
-            prompts=prompts,
-            thresholds=thresholds,
-            label=f"sam3mask[b={bi}]",
-            silent=True,
-        )
+        # IMPORTANT: Lightning may run training under bf16 autocast, but SAM3 internals use fp32 weights.
+        # Some SAM3 ops are executed outside autocast, which can lead to:
+        #   "Input type (CUDABFloat16Type) and weight type (torch.FloatTensor) should be the same"
+        # To avoid dtype mismatches, run SAM3 mask inference with autocast disabled (fp32).
+        if gt01_btchw.is_cuda:
+            with torch.autocast(device_type="cuda", enabled=False):
+                out = segment_with_sam3_text_prompts(
+                    sam3_processor,
+                    img_pil_list[bi],
+                    prompts=prompts,
+                    thresholds=thresholds,
+                    label=f"sam3mask[b={bi}]",
+                    silent=True,
+                )
+        else:
+            out = segment_with_sam3_text_prompts(
+                sam3_processor,
+                img_pil_list[bi],
+                prompts=prompts,
+                thresholds=thresholds,
+                label=f"sam3mask[b={bi}]",
+                silent=True,
+            )
         masks = out["masks"]
         if torch.is_tensor(masks) and masks.numel() > 0 and masks.shape[0] > 0:
             union = masks.any(dim=0)  # (1,H,W) bool

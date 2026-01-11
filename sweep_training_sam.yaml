@@ -9,8 +9,8 @@ metric:
 
 parameters:
   # SAM3 alpha hyperparameter search
-  #custom_loss.sam3_alpha:
-  #  values: [0.5, 1.0, 1.5, 2.0, 3.0]
+  custom_loss.sam3_alpha:
+    values: [0.01, 0.1, 1.0, 10.0]
   # Optional: also search other SAM3 parameters
   custom_loss.sam3_view:
      values: ["both","static", "gripper"]
@@ -23,14 +23,10 @@ parameters:
      values: [true]
   msillm.compress_rgb:
      values: [true]
-
-  # Checkpoint save directory (absolute; not affected by os.chdir(seed_*) during training)
-  callbacks.checkpoint.dirpath:
-     value: ${hydra:runtime.cwd}/slurm_scripts/saved_models/zero_padding_sam
   
   # MS-ILLM entrypoint (quality) parameter
   msillm.entrypoint:
-     values: ["msillm_quality_vlo1", "msillm_quality_vlo2", "msillm_quality_1"]
+     values: ["msillm_quality_vlo1", "msillm_quality_1"]
   
   # Training configuration parameters
   # train_vision_encoders:

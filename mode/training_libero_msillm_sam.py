@@ -403,7 +403,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
     model.embed_visual_obs = types.MethodType(_patched, model)
     return decoder
 
-@hydra.main(config_path="../conf", config_name="config_libero_msillm")
+@hydra.main(config_path="../conf", config_name="config_libero_msillm_sam")
 def train(cfg: DictConfig) -> None:
     try:
         seed_everything(cfg.seed, workers=True)
