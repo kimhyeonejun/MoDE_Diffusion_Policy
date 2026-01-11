@@ -83,7 +83,7 @@ pretrain_chk_filename: "model_cleaned.safetensors"  # optional, default: model_c
 custom_loss:
   # Enable SAM3-guided reconstruction loss (sam3_weighted_recon_loss) by default for this entrypoint.
   # This avoids requiring `custom_loss.fn` and avoids importing this training script as a module.
-  use_sam3_weighted_recon_loss: true
+  fn: mode.training_libero_msillm_sam:sam3_weighted_recon_loss
   # Optional: additional user-defined custom loss hook weight
   # Used only when `custom_loss.fn` (or env `CUSTOM_LOSS_FN`) is provided.
   weight: 1.0
