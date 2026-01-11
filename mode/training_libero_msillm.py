@@ -121,32 +121,32 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
         # All steps except decoder should be no_grad to ensure only decoder trains
         # IMPORTANT: Explicitly delete intermediate tensors to save memory (especially when compress_gripper=True)
         #with torch.no_grad():
-        # Step 1: Encode image to latent (same as msillm.forward line 498)
-        latent = encoder(x01_bt_resized)
-        # Delete input after encoding to free memory
-        del x01_bt_resized
-        
-        # Step 2: Hyperprior analysis (same as msillm.forward line 501)
-        hyper_latent = msillm.hyper_analysis(latent)
-        hyper_latent, _ = msillm.hyper_bottleneck(hyper_latent)
-        
-        # Step 3: Hyperprior synthesis (mean and scale) (same as msillm.forward lines 507-508)
-        means = msillm.hyper_synthesis_mean(hyper_latent)
-        scales = msillm.hyper_synthesis_scale(hyper_latent)
-        
-        # Delete hyper_latent to free memory (no longer needed after synthesis)
-        del hyper_latent
-        
-        # Step 4: Latent bottleneck (quantization) (same as msillm.forward line 509-510)
-        quantized_latents, _ = msillm.latent_bottleneck(latent, scales, means=means)
-        
-        # Delete intermediate tensors to free memory (only quantized_latent is needed)
-        del latent, means, scales
-        
-        # Step 5: Use quantized latents (same as msillm.forward line 521 for eval mode)
-        # Note: We use quantized_latents (not STE) since encoder/intermediate steps are frozen
-        quantized_latent = quantized_latents
-        del quantized_latents  # Free memory, only quantized_latent is needed
+            # Step 1: Encode image to latent (same as msillm.forward line 498)
+            latent = encoder(x01_bt_resized)
+            # Delete input after encoding to free memory
+            del x01_bt_resized
+            
+            # Step 2: Hyperprior analysis (same as msillm.forward line 501)
+            hyper_latent = msillm.hyper_analysis(latent)
+            hyper_latent, _ = msillm.hyper_bottleneck(hyper_latent)
+            
+            # Step 3: Hyperprior synthesis (mean and scale) (same as msillm.forward lines 507-508)
+            means = msillm.hyper_synthesis_mean(hyper_latent)
+            scales = msillm.hyper_synthesis_scale(hyper_latent)
+            
+            # Delete hyper_latent to free memory (no longer needed after synthesis)
+            del hyper_latent
+            
+            # Step 4: Latent bottleneck (quantization) (same as msillm.forward line 509-510)
+            quantized_latents, _ = msillm.latent_bottleneck(latent, scales, means=means)
+            
+            # Delete intermediate tensors to free memory (only quantized_latent is needed)
+            del latent, means, scales
+            
+            # Step 5: Use quantized latents (same as msillm.forward line 521 for eval mode)
+            # Note: We use quantized_latents (not STE) since encoder/intermediate steps are frozen
+            quantized_latent = quantized_latents
+            del quantized_latents  # Free memory, only quantized_latent is needed
         
         # CRITICAL: Detach quantized_latent to break gradient flow from encoder (which is frozen)
         # but allow decoder gradients to flow. This prevents the "does not require grad" error.
@@ -171,7 +171,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
         # Apply MS-ILLM reconstruction so decoder gradients flow.
         # Only reconstruct rgb_static if configured
         if compress_rgb:
-            rgb_static = _reconstruct_normed(rgb_static)
+        rgb_static = _reconstruct_normed(rgb_static)
         else:
             # Normalize static image even when not compressing (inputs are in [0, 1] range)
             mean, std = clip_mean_std(rgb_static.device, rgb_static.dtype)
