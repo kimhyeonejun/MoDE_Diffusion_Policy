@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
-import wandb
 import hydra
 from omegaconf import DictConfig
 from pytorch_lightning import Callback, LightningModule
@@ -289,29 +288,6 @@ def extract_msillm_identifier_from_checkpoint_path(checkpoint_path: Path) -> Opt
             return identifier
     
     return None
-
-
-class WandbConfigCallback(Callback):
-    """Callback to update wandb config after wandb is initialized."""
-    def __init__(self, msillm_cfg: Optional[DictConfig] = None, msillm_info: str = ""):
-        super().__init__()
-        self.msillm_cfg = msillm_cfg
-        self.msillm_info = msillm_info
-    
-    def on_train_start(self, trainer, pl_module):
-        """Update wandb config when training starts (wandb.run is available)."""
-        if wandb.run is None:
-            log_rank_0("Warning: wandb.run is None, skipping wandb config update")
-            return
-        
-        if self.msillm_cfg is not None and self.msillm_info:
-            wandb.config.update({
-                "msillm_hub_repo": self.msillm_cfg.get("hub_repo", "unknown"),
-                "msillm_entrypoint": self.msillm_cfg.get("entrypoint", "unknown"),
-                "msillm_pretrained": self.msillm_cfg.get("pretrained", False),
-                "msillm_identifier": self.msillm_info,
-            }, allow_val_change=True)
-            log_rank_0(f"Updated wandb config with MS-ILLM information")
 
 
 def setup_callbacks(callbacks_cfg: DictConfig, msillm_info: str = "") -> list[Callback]:

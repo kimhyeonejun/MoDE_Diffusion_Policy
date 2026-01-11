@@ -40,7 +40,6 @@ from mode.training_utils import (
     log_rank_0,
     get_msillm_identifier,
     extract_msillm_identifier_from_checkpoint_path,
-    WandbConfigCallback,
     setup_callbacks,
     setup_logger,
     extract_compression_modules,
@@ -347,13 +346,7 @@ def train(cfg: DictConfig) -> None:
             if checkpoint_msillm_info:
                 msillm_info = checkpoint_msillm_info
         
-        # Create wandb config callback to update config when training starts
-        msillm_cfg_for_callback = cfg.msillm if msillm_info and "msillm" in cfg else None
-        wandb_config_callback = WandbConfigCallback(msillm_cfg=msillm_cfg_for_callback, msillm_info=msillm_info) if msillm_info else None
-        
         callbacks = setup_callbacks(cfg.callbacks, msillm_info=msillm_info) + [LearningRateMonitor(logging_interval="step")]
-        if wandb_config_callback is not None:
-            callbacks.append(wandb_config_callback)
         
         # Set unique working directory for each seed
         work_dir = Path.cwd() / f"seed_{cfg.seed}"
