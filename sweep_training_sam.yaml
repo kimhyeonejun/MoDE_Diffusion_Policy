@@ -1,6 +1,7 @@
 project: mode-libero-msillm-sam
 entity: goodi20343-korea-advanced-institute-of-science-and-techn
 program: mode/training_libero_msillm_sam.py
+name: sam3-compress-both-true-zero-mask-loss
 method: grid
 metric:
   goal: minimize
@@ -19,13 +20,13 @@ parameters:
   
   # MS-ILLM compression parameters
   msillm.compress_gripper:
-     values: [true, false]
+     values: [true]
   msillm.compress_rgb:
-     values: [true, false]
+     values: [true]
   
   # MS-ILLM entrypoint (quality) parameter
-  # msillm.entrypoint:
-  #   values: ["msillm_quality_vlo1", "msillm_quality_vlo2", "msillm_quality_1"]
+  msillm.entrypoint:
+     values: ["msillm_quality_vlo1", "msillm_quality_vlo2", "msillm_quality_1"]
   
   # Training configuration parameters
   # train_vision_encoders:

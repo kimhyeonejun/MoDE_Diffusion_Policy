@@ -16,7 +16,10 @@ checkpoint: null  # Set to null to use pretrain_chk from config_libero_msillm.ya
 device: 0
 use_ema_weights: true  # Set to true to use EMA weights instead of regular weights (if available in checkpoint)
 
-log_dir: /home/khj20343/MoDE_Diffusion_Policy/outputs/libero_eval
+# Base output directory for evaluation artifacts (videos, results.json, wandb dir, etc.)
+# With the current `get_log_dir()` logic, outputs will be saved under:
+#   ${log_dir}/<checkpoint_relative_path_without_suffix>/
+log_dir: outputs/eval
 dataset_path: /tmp
 num_videos: 1
 use_reconstructed_video: false  # If true, save MS-ILLM reconstructed images to video; if false, save original env images

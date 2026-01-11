@@ -67,7 +67,7 @@ callbacks:
     save_top_k: 3
     monitor: val_act/lang_act_loss_pp  # Changed from eval_lh/avg_seq_len since rollout_lh callback is disabled
     mode: min  # Changed from max since we want to minimize loss
-    dirpath: ${hydra:runtime.cwd}/saved_models  # Use absolute path for clarity
+    dirpath: slurm_scripts/saved_models/zero_padding_sam/${custom_loss.sam3_view}  # Use absolute path for clarity
     filename: '{epoch:02d}'  # Format: epoch number only (e.g., 02, 69) - MS-ILLM prefix will be added automatically
   #ema:
   #  save_ema_weights_in_callback_state: False  # Don't save EMA weights in checkpoint to reduce size (~3.77GB savings)

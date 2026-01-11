@@ -120,23 +120,42 @@ class LatentCaptureWrapper:
         self.call_count = 0
 
 def get_log_dir(log_dir, checkpoint_name=None):
-    # Use checkpoint-based directory if checkpoint name is provided
-    if checkpoint_name:
-        checkpoint_stem = Path(checkpoint_name).stem  # Remove .ckpt extension
-        log_dir = Path("outputs") / checkpoint_stem
-        os.makedirs(log_dir, exist_ok=True)
+    """
+    Resolve evaluation output directory.
+    
+    Behavior:
+    - If `checkpoint_name` is provided: use it as a subdirectory name under a *base* directory.
+      The base directory is `log_dir` (if provided), otherwise Hydra's run dir (if active),
+      otherwise a sensible default under the repo.
+    - If `checkpoint_name` is not provided: use Hydra's run dir (if active), else `log_dir`,
+      else default under the repo.
+    """
+    hydra_output_dir = Path.cwd()
+    running_under_hydra = (hydra_output_dir / ".hydra").exists()
+
+    # Choose base directory
+    if log_dir is not None:
+        base_dir = Path(log_dir)
+    elif running_under_hydra:
+        base_dir = hydra_output_dir
     else:
-        # Fallback to Hydra's output directory or specified log_dir
-        hydra_output_dir = Path.cwd()
-        if (hydra_output_dir / ".hydra").exists():
-            # We're running under Hydra, use its output directory
-            log_dir = hydra_output_dir
-        elif log_dir is not None:
-            log_dir = Path(log_dir)
-            os.makedirs(log_dir, exist_ok=True)
+        base_dir = Path(__file__).parents[3] / "outputs" / "libero_eval"
+
+    # If checkpoint_name is provided, namespace outputs under base_dir/<checkpoint_path_without_suffix>
+    # e.g. checkpoint_name="zero_padding_sam/foo/bar/epoch=02.ckpt"
+    #   -> base_dir/"zero_padding_sam/foo/bar/epoch=02"
+    if checkpoint_name:
+        ckpt_path = Path(checkpoint_name)
+        # Avoid mirroring absolute paths into the output directory tree.
+        if ckpt_path.is_absolute():
+            ckpt_subdir = Path(ckpt_path.stem)
         else:
-            log_dir = Path(__file__).parents[3] / "outputs" / "libero_eval"
-            os.makedirs(log_dir, exist_ok=True)
+            ckpt_subdir = ckpt_path.with_suffix("")  # keeps subdirectories, drops extension
+        log_dir = base_dir / ckpt_subdir
+    else:
+        log_dir = base_dir
+
+    os.makedirs(log_dir, exist_ok=True)
     
     print(f"logging to {log_dir}")
     return log_dir
