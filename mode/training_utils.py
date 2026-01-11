@@ -139,6 +139,21 @@ def count_params(module: Optional[torch.nn.Module]) -> tuple[int, int]:
     return total, trainable
 
 
+def cfg_get(cfg_obj, key: str, default):
+    """
+    Safe getter for Hydra DictConfig / dict-like / attribute-like configs.
+    Returns `default` if cfg_obj is None, key is missing, or access raises.
+    """
+    if cfg_obj is None:
+        return default
+    try:
+        if hasattr(cfg_obj, "get"):
+            return cfg_obj.get(key, default)
+        return getattr(cfg_obj, key, default)
+    except Exception:
+        return default
+
+
 def patch_optimizer_to_only_train_selected(
     model: LightningModule,
     *,

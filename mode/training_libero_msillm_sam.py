@@ -44,6 +44,7 @@ from mode.training_utils import (
     patch_on_before_zero_grad_for_msillm,
     set_requires_grad,
     count_params,
+    cfg_get,
     patch_optimizer_to_only_train_selected,
     freeze_all_except_vision_encoders,
     clear_cuda_cache,
@@ -64,6 +65,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+# Global custom-loss config cache (populated in `train()` so loss hooks can read cfg values).
+_CUSTOM_LOSS_CFG = None
 
 def _load_custom_loss_hook(cfg: DictConfig):
     """
@@ -159,18 +163,6 @@ def _patch_training_step_with_custom_loss(
     model.training_step = _patched_training_step
     log_rank_0(f"Patched training_step with custom loss: {loss_fn} (weight={weight}, log={log_name})")
 
-_CUSTOM_LOSS_CFG = None
-
-def _cfg_get(cfg_obj, key: str, default):
-    if cfg_obj is None:
-        return default
-    try:
-        if hasattr(cfg_obj, "get"):
-            return cfg_obj.get(key, default)
-        return getattr(cfg_obj, key, default)
-    except Exception:
-        return default
-
 # SAM3-related helper functions are now in sam.utils.sam3_weight_map
 
 def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> torch.Tensor:
@@ -193,10 +185,10 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
         return torch.tensor(0.0, device=model.device)
 
     cfg = _CUSTOM_LOSS_CFG
-    alpha = float(_cfg_get(cfg, "sam3_alpha", 1.0))
-    view = str(_cfg_get(cfg, "sam3_view", "both"))  # "static", "gripper", "both"
-    conf_thr = float(_cfg_get(cfg, "sam3_confidence_threshold", 0.05))
-    thresholds = _cfg_get(cfg, "sam3_thresholds", [conf_thr, 0.10, 0.05])
+    alpha = float(cfg_get(cfg, "sam3_alpha", 1.0))
+    view = str(cfg_get(cfg, "sam3_view", "both"))  # "static", "gripper", "both"
+    conf_thr = float(cfg_get(cfg, "sam3_confidence_threshold", 0.05))
+    thresholds = cfg_get(cfg, "sam3_thresholds", [conf_thr, 0.10, 0.05])
     if isinstance(thresholds, (float, int)):
         thresholds = [float(thresholds)]
     thresholds = [float(t) for t in thresholds]
