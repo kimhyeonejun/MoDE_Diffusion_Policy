@@ -96,7 +96,7 @@ custom_loss:
   # Confidence threshold for SAM3 segmentation
   sam3_confidence_threshold: 0.05
   # List of thresholds to try for SAM3 segmentation (best result per prompt is selected)
-  sam3_thresholds: [0.05, 0.10, 0.05]
+  sam3_thresholds: [0.05]
 
 trainer:
   devices: ${devices}

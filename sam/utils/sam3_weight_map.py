@@ -43,6 +43,12 @@ def get_sam3_processor(device: str | torch.device, logger=None):
         device_str = "cuda" if str(device).startswith("cuda") else "cpu"
 
     sam3_model = build_sam3_image_model(device=device_str, eval_mode=True)
+    # Ensure SAM3 weights stay in fp32 even when the outer training loop uses bf16 autocast.
+    sam3_model = sam3_model.to(dtype=torch.float32)
+    # Explicitly freeze SAM3 model parameters (eval_mode sets model.eval() but doesn't freeze gradients)
+    for param in sam3_model.parameters():
+        param.requires_grad = False
+    sam3_model.eval()  # Ensure eval mode is set
     _SAM3_LOSS_PROCESSOR = Sam3Processor(sam3_model, device=device_str, confidence_threshold=0.05)
     if logger is not None:
         logger.info("[SAM3 recon loss] Initialized SAM3 processor")
@@ -59,7 +65,9 @@ def tensor01_to_pil(x01_chw: torch.Tensor) -> Image.Image:
     Returns:
         PIL Image in RGB format
     """
-    x = x01_chw.detach().clamp(0.0, 1.0).mul(255.0).to(torch.uint8).cpu()
+    # Convert to float32 first to handle bfloat16 inputs properly
+    # This ensures all operations work correctly regardless of input dtype
+    x = x01_chw.detach().to(dtype=torch.float32).clamp(0.0, 1.0).mul(255.0).to(torch.uint8).cpu()
     if x.shape[0] == 1:
         x = x.repeat(3, 1, 1)
     x_hwc = x.permute(1, 2, 0).numpy()
@@ -108,10 +116,6 @@ def compute_weight_map(
     device = gt01_btchw.device
     model = sam3_processor.model
 
-    # 1) Precompute image features for the whole batch once.
-    state = sam3_processor.set_image_batch(img_pil_list)
-    backbone_out = state["backbone_out"]
-
     # 2) Prepare per-image IDs for batch grounding.
     img_ids = torch.arange(b, device=device, dtype=torch.long)
     # We run one text prompt at a time (single prompt embedding), and point all images to text_id=0.
@@ -130,6 +134,10 @@ def compute_weight_map(
     )
 
     with autocast_ctx:
+        # 1) Precompute image features for the whole batch once (keep in fp32; Lightning may run bf16 autocast).
+        state = sam3_processor.set_image_batch(img_pil_list)
+        backbone_out = state["backbone_out"]
+
         for prompt in prompts:
             # Precompute text features once per prompt.
             # NOTE: We pass a single prompt string; `text_ids` broadcasts it to all images.
@@ -169,7 +177,12 @@ def compute_weight_map(
                 probs = logits.sigmoid()
                 presence = outputs.get("presence_logit_dec", None)
                 if presence is not None:
-                    probs = probs * presence.sigmoid().unsqueeze(1)
+                    # Some variants return presence with extra trailing dims (e.g., (B, K)).
+                    # Reduce to a single scalar per image, then broadcast over masks.
+                    p = presence.sigmoid()
+                    if p.dim() > 1:
+                        p = p.reshape(p.shape[0], -1).amax(dim=-1)
+                    probs = probs * p.unsqueeze(1)
                 keep = probs > float(thr)  # (B, Q) bool
                 num_masks = keep.sum(dim=1)  # (B,)
 
@@ -276,14 +289,6 @@ def compute_weight_map_from_lang_text_batch(
 
     model = sam3_processor.model
 
-    # 1) Precompute image features for the whole batch once.
-    state = sam3_processor.set_image_batch(img_pil_list)
-    backbone_out = state["backbone_out"]
-
-    # 2) Precompute text features for all unique prompt strings once.
-    text_outputs = model.backbone.forward_text(find_text_batch, device=str(sam3_processor.device))
-    backbone_out.update(text_outputs)
-
     # 3) Prepare query mappings.
     q = len(query_prompts)
     img_ids_q = torch.tensor(query_img_ids, device=device, dtype=torch.long)
@@ -299,7 +304,15 @@ def compute_weight_map_from_lang_text_batch(
         torch.autocast(device_type="cuda", enabled=False) if gt01_btchw.is_cuda else nullcontext()
     )
 
-    with autocast_ctx:
+    with torch.no_grad(), autocast_ctx:
+        # 1) Precompute image features for the whole batch once (keep in fp32; Lightning may run bf16 autocast).
+        state = sam3_processor.set_image_batch(img_pil_list)
+        backbone_out = state["backbone_out"]
+
+        # 2) Precompute text features for all unique prompt strings once.
+        text_outputs = model.backbone.forward_text(find_text_batch, device=str(sam3_processor.device))
+        backbone_out.update(text_outputs)
+
         for thr in thresholds:
             find_input = FindStage(
                 img_ids=img_ids_q,
@@ -318,19 +331,31 @@ def compute_weight_map_from_lang_text_batch(
                 geometric_prompt=geometric_prompt,
                 find_target=None,
             )
-
+            
+            # Reduce logits to per-(query,mask) scores (Q, N).
             logits = outputs["pred_logits"]
-            if logits.dim() == 3:
+            if logits.dim() == 3 and logits.shape[-1] == 1:
                 logits = logits.squeeze(-1)
+            elif logits.dim() > 2:
+                logits = logits.reshape(logits.shape[0], logits.shape[1], -1).amax(dim=-1)
+            
             probs = logits.sigmoid()
             presence = outputs.get("presence_logit_dec", None)
             if presence is not None:
-                probs = probs * presence.sigmoid().unsqueeze(1)
-
+                p = presence.sigmoid()
+                if p.dim() > 1:
+                    p = p.reshape(p.shape[0], -1).amax(dim=-1)
+                probs = probs * p.unsqueeze(1)
+                
+            masks = outputs["pred_masks"]  # (Q, N, h', w')
             keep = probs > float(thr)  # (Q, N)
             num_masks = keep.sum(dim=1)  # (Q,)
-
-            masks = outputs["pred_masks"]  # (Q, N, h', w')
+            
+            # Free memory: delete outputs immediately after extraction
+            del outputs, logits, presence
+            
+            # Interpolate masks to (h, w) and compute union
+            # Process in chunks to reduce peak memory if needed
             qn = masks.shape[0] * masks.shape[1]
             masks01 = interpolate(
                 masks.reshape(qn, 1, masks.shape[-2], masks.shape[-1]),
@@ -340,6 +365,9 @@ def compute_weight_map_from_lang_text_batch(
             ).sigmoid()
             masks_bin = masks01.reshape(q, masks.shape[1], h, w) > 0.5
             thr_union = (masks_bin & keep[:, :, None, None]).any(dim=1)  # (Q,H,W)
+            
+            # Free memory: delete intermediate tensors immediately
+            del masks, masks01, masks_bin
 
             thr_f = torch.full((q,), float(thr), device=device, dtype=torch.float32)
             better = (thr_f > best_thr) | ((thr_f == best_thr) & (num_masks > best_num))
@@ -347,6 +375,9 @@ def compute_weight_map_from_lang_text_batch(
                 best_thr = torch.where(better, thr_f, best_thr)
                 best_num = torch.where(better, num_masks, best_num)
                 best_union = torch.where(better[:, None, None], thr_union, best_union)
+            
+            # Free memory: delete threshold-specific results
+            del thr_union, thr_f, better
 
     # Aggregate to per-image union mask.
     union_bt_hw = torch.zeros((b, h, w), dtype=torch.bool, device=device)

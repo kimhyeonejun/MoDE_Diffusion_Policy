@@ -62,8 +62,8 @@ def _calculate_bpp_from_latents(bpp_wrapper, data, sensors):
     latents = bpp_wrapper.latents[-len(sensors):]
     for sensor_name, latent in zip(sensors, latents):
         img = data["rgb_obs"][sensor_name].squeeze(0)  # (C, H, W)
-                bpp = calculate_bpp_from_hyperprior_output(latent, img.shape)
-            bpp_dict[sensor_name] = bpp
+        bpp = calculate_bpp_from_hyperprior_output(latent, img.shape)
+        bpp_dict[sensor_name] = bpp
     return bpp_dict
 
 
@@ -83,9 +83,9 @@ def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_stati
         if hasattr(model, tensor_attr):
             recon_frame = getattr(model, tensor_attr)
             if recon_frame is not None:
-            rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
-            return rgb_recon_np[..., ::-1]  # RGB to BGR
+                rgb_recon_np = (recon_frame.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
+                return rgb_recon_np[..., ::-1]  # RGB to BGR
         # If reconstructed frame is not available (e.g., compress_rgb=False), fall through to use data/obs
     
     # Use transforms-processed image if available (already in [0, 1] range, no denormalize needed)
@@ -155,7 +155,7 @@ def get_log_dir(log_dir, checkpoint_name=None):
     else:
         log_dir = base_dir
 
-            os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
     
     print(f"logging to {log_dir}")
     return log_dir
@@ -444,7 +444,7 @@ class EvaluateLibero:
                 # Write static video using imageio
                 if len(video_frames_static) > 0:
                     video_writer_static = imageio.get_writer(video_path_static, fps=fps)
-                for frame in video_frames_static:
+                    for frame in video_frames_static:
                         # Convert BGR to RGB for imageio
                         frame_rgb = frame[..., ::-1]
                         video_writer_static.append_data(frame_rgb)
@@ -456,7 +456,7 @@ class EvaluateLibero:
                 # Write gripper video using imageio
                 if len(video_frames_gripper) > 0:
                     video_writer_gripper = imageio.get_writer(video_path_gripper, fps=fps)
-                for frame in video_frames_gripper:
+                    for frame in video_frames_gripper:
                         # Convert BGR to RGB for imageio
                         frame_rgb = frame[..., ::-1]
                         video_writer_gripper.append_data(frame_rgb)
@@ -561,17 +561,17 @@ def _instantiate_transforms(transforms_cfg):
 
 def _load_transforms(loaded_cfg, dm, cfg):
     """Load transforms with fallback chain."""
-        # Try from loaded config first
-        if hasattr(loaded_cfg, 'datamodule') and hasattr(loaded_cfg.datamodule, 'transforms'):
-            transforms_cfg = loaded_cfg.datamodule.transforms.get("val", loaded_cfg.datamodule.transforms)
-        # Fallback to DM transforms
-        elif hasattr(dm, 'transforms') and dm.transforms is not None:
-            transforms_cfg = dm.transforms.get('val', dm.transforms) if isinstance(dm.transforms, dict) else dm.transforms
-        # Final fallback to current cfg
-        else:
-            transforms_cfg = cfg.datamodule.transforms.get("val", cfg.datamodule.transforms)
-        
-        return _instantiate_transforms(transforms_cfg)
+    # Try from loaded config first
+    if hasattr(loaded_cfg, 'datamodule') and hasattr(loaded_cfg.datamodule, 'transforms'):
+        transforms_cfg = loaded_cfg.datamodule.transforms.get("val", loaded_cfg.datamodule.transforms)
+    # Fallback to DM transforms
+    elif hasattr(dm, 'transforms') and dm.transforms is not None:
+        transforms_cfg = dm.transforms.get('val', dm.transforms) if isinstance(dm.transforms, dict) else dm.transforms
+    # Final fallback to current cfg
+    else:
+        transforms_cfg = cfg.datamodule.transforms.get("val", cfg.datamodule.transforms)
+    
+    return _instantiate_transforms(transforms_cfg)
 
 
 def _get_device_config(cfg):
