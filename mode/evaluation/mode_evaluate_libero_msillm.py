@@ -449,9 +449,8 @@ class EvaluateLibero:
                         frame_rgb = frame[..., ::-1]
                         video_writer_static.append_data(frame_rgb)
                     video_writer_static.close()
-                    print(f"[Video] Saved static video: {video_path_static} ({len(video_frames_static)} frames)")
                 else:
-                    print(f"[Video] Warning: No static frames captured for video")
+                    pass
                 
                 # Write gripper video using imageio
                 if len(video_frames_gripper) > 0:
@@ -461,9 +460,8 @@ class EvaluateLibero:
                         frame_rgb = frame[..., ::-1]
                         video_writer_gripper.append_data(frame_rgb)
                     video_writer_gripper.close()
-                    print(f"[Video] Saved gripper video: {video_path_gripper} ({len(video_frames_gripper)} frames)")
                 else:
-                    print(f"[Video] Warning: No gripper frames captured for video")
+                    pass
 
             # a new form of success record
             num_success += int(done)
