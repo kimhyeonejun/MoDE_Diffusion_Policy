@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 from collections import OrderedDict
+import os
 import torch.nn.functional as F
 import torch
 from PIL import Image
@@ -27,6 +28,12 @@ _SAM3_LOSS_PROCESSOR: dict[tuple[str, int, float, str], object] = {}
 # GPU memory usage: ~19 prompts * ~(256+1024) dims * float32 = ~0.1MB (negligible).
 _TEXT_FEAT_CACHE: "OrderedDict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]" = OrderedDict()
 _TEXT_FEAT_CACHE_MAX = 4096  # max unique prompt strings to keep
+
+# Profiling / debug logging switch.
+# Default OFF (user requested to remove debugging output).
+# To enable profiling logs temporarily:
+#   export SAM3_PROFILING=1
+_SAM3_PROFILING = os.environ.get("SAM3_PROFILING", "0") == "1"
 
 
 def _get_text_outputs_cached(model, prompts: list[str], *, device: torch.device | str):
@@ -436,9 +443,10 @@ def compute_weight_map_from_lang_text_batch(
     import time
 
     with torch.no_grad(), autocast_ctx:
-        # NOTE: time.time() around CUDA work is easily "lied to" by async execution
-        # (the sync cost often gets charged to a later line). Use CUDA events when possible.
-        use_cuda_events = sam_device.type == "cuda"
+        # Profiling is expensive and noisy; default OFF.
+        enable_profiling = bool(_SAM3_PROFILING)
+        # NOTE: time.time() around CUDA work is easily "lied to" by async execution.
+        use_cuda_events = enable_profiling and (sam_device.type == "cuda")
 
         def _evt():
             # Record an event on the correct device/stream.
@@ -479,7 +487,7 @@ def compute_weight_map_from_lang_text_batch(
         # Use SAM3's built-in method to create dummy geometric prompt
         geometric_prompt = model._get_dummy_prompt(num_prompts=q)
 
-        # forward_grounding timings
+        # forward_grounding timings (only collected when profiling is enabled)
         t_forward_total = 0.0
         fwd_evt_pairs = []  # list[(evt_start, evt_end)]
         num_thresholds = len(thresholds)
@@ -511,233 +519,89 @@ def compute_weight_map_from_lang_text_batch(
                 input_points_mask=None,
             )
             
-            # Detailed timing for forward_grounding sub-steps
-            # Monkey-patch to measure internal steps
-            original_encode_prompt = model._encode_prompt
-            original_run_encoder = model._run_encoder
-            original_run_decoder = model._run_decoder
-            original_run_segmentation_heads = model._run_segmentation_heads
-            
-            def timed_encode_prompt(*args, **kwargs):
-                if use_cuda_events:
-                    e0 = _evt()
-                    result = original_encode_prompt(*args, **kwargs)
-                    e1 = _evt()
-                    encode_times.append((e0, e1))
-                else:
-                    t0 = time.time()
-                    result = original_encode_prompt(*args, **kwargs)
-                    encode_times.append(time.time() - t0)
-                return result
-            
-            def timed_run_encoder(*args, **kwargs):
-                if use_cuda_events:
-                    e0 = _evt()
-                else:
-                    t0 = time.time()
-                # Also measure transformer.encoder.forward time and each layer
-                original_transformer_encoder_forward = model.transformer.encoder.forward
-                original_prepare_multilevel = model.transformer.encoder._prepare_multilevel_features
-                local_transformer_times = []
-                layer_times = []
-                prepare_times = []
-                
-                # Patch _prepare_multilevel_features to measure time and internal steps
-                def timed_prepare_multilevel(srcs, masks, pos_embeds):
-                    t_prep0 = time.time()
-                    # Measure individual operations
-                    t_flatten_start = time.time()
-                    src_flatten = []
-                    mask_flatten = []
-                    lvl_pos_embed_flatten = []
-                    spatial_shapes = []
-                    has_mask = masks is not None and masks[0] is not None
-                    t_flatten_prep = time.time() - t_flatten_start
-                    
-                    t_loop_start = time.time()
-                    for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
-                        bs, c, h, w = src.shape
-                        spatial_shape = (h, w)
-                        spatial_shapes.append(spatial_shape)
-                        
-                        src = src.flatten(2).transpose(1, 2)  # bs, hw, c
-                        if has_mask:
-                            mask = mask.flatten(1)
-                        pos_embed = pos_embed.flatten(2).transpose(1, 2)  # bs, hw, c
-                        
-                        if model.transformer.encoder.level_embed is not None:
-                            lvl_pos_embed = pos_embed + model.transformer.encoder.level_embed[lvl].view(1, 1, -1)
-                        else:
-                            lvl_pos_embed = pos_embed
-                        lvl_pos_embed_flatten.append(lvl_pos_embed)
-                        src_flatten.append(src)
-                        if has_mask:
-                            mask_flatten.append(mask)
-                    
-                    t_loop_elapsed = time.time() - t_loop_start
-                    t_cat_start = time.time()
-                    src_flatten = torch.cat(src_flatten, 1)  # bs, \sum{hxw}, c
-                    mask_flatten = torch.cat(mask_flatten, 1) if has_mask else None  # bs, \sum{hxw}
-                    lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)  # bs, \sum{hxw}, c
-                    t_cat_elapsed = time.time() - t_cat_start
-                    
-                    t_spatial_start = time.time()
-                    t_device_start = time.time()
-                    # Check if we need to sync (original code uses src_flatten.device which may cause sync)
-                    # We use pre-extracted device to avoid sync, but let's verify
-                    actual_device = device  # Already extracted from srcs[0] at function start
-                    t_device_elapsed = time.time() - t_device_start
-                    
-                    t_tensor_start = time.time()
-                    # NOTE: spatial_shapes is used for indexing/shape math inside SAM3 encoder.
-                    # It must be integer type and on the same device as the vision features.
-                    spatial_shapes = torch.tensor(
-                        spatial_shapes, dtype=torch.long, device=actual_device
-                    )
-                    t_tensor_elapsed = time.time() - t_tensor_start
-                    
-                    t_index_start = time.time()
-                    level_start_index = torch.cat(
-                        (
-                            spatial_shapes.new_zeros((1,)),
-                            spatial_shapes.prod(1).cumsum(0)[:-1],
-                        )
-                    )
-                    t_index_elapsed = time.time() - t_index_start
-                    
-                    t_valid_start = time.time()
-                    if has_mask:
-                        from sam3.model.model_misc import get_valid_ratio  # type: ignore[import-not-found]
-                        valid_ratios = torch.stack([get_valid_ratio(m) for m in masks], 1)
+            if enable_profiling:
+                # Detailed timing for forward_grounding sub-steps (expensive / noisy).
+                # Monkey-patch to measure internal steps.
+                original_encode_prompt = model._encode_prompt
+                original_run_encoder = model._run_encoder
+                original_run_decoder = model._run_decoder
+                original_run_segmentation_heads = model._run_segmentation_heads
+
+                def timed_encode_prompt(*args, **kwargs):
+                    if use_cuda_events:
+                        e0 = _evt()
+                        result = original_encode_prompt(*args, **kwargs)
+                        e1 = _evt()
+                        encode_times.append((e0, e1))
                     else:
-                        valid_ratios = torch.ones(
-                            (src_flatten.shape[0], model.transformer.encoder.num_feature_levels, 2),
-                            device=src_flatten.device,
-                        )
-                    t_valid_elapsed = time.time() - t_valid_start
-                    t_spatial_elapsed = time.time() - t_spatial_start
-                    
-                    prepare_times.append(time.time() - t_prep0)
-                    
-                    # Store detailed timing for logging (use outer scope variable)
-                    prepare_detail_times['flatten_prep'].append(t_flatten_prep)
-                    prepare_detail_times['loop'].append(t_loop_elapsed)
-                    prepare_detail_times['cat'].append(t_cat_elapsed)
-                    prepare_detail_times['spatial'].append(t_spatial_elapsed)
-                    prepare_detail_times['spatial_device'].append(t_device_elapsed)
-                    prepare_detail_times['spatial_tensor'].append(t_tensor_elapsed)
-                    prepare_detail_times['spatial_index'].append(t_index_elapsed)
-                    prepare_detail_times['spatial_valid'].append(t_valid_elapsed)
-                    
-                    return (
-                        src_flatten,
-                        mask_flatten,
-                        lvl_pos_embed_flatten,
-                        level_start_index,
-                        valid_ratios,
-                        spatial_shapes,
-                    )
-                
-                # Patch each encoder layer to measure time
-                original_layer_forwards = []
-                for layer_idx, layer in enumerate(model.transformer.encoder.layers):
-                    original_layer_forward = layer.forward
-                    def make_timed_layer_forward(layer_idx, orig_forward):
-                        def timed_layer_forward(*layer_args, **layer_kwargs):
-                            t_layer0 = time.time()
-                            result = orig_forward(*layer_args, **layer_kwargs)
-                            layer_times.append((layer_idx, time.time() - t_layer0))
-                            return result
-                        return timed_layer_forward
-                    layer.forward = make_timed_layer_forward(layer_idx, original_layer_forward)
-                    original_layer_forwards.append((layer_idx, original_layer_forward))
-                
-                # Also measure get_reference_points time
-                original_get_reference_points = model.transformer.encoder.get_reference_points
-                reference_points_times_local = []
-                
-                def timed_get_reference_points(*args, **kwargs):
-                    t_ref0 = time.time()
-                    result = original_get_reference_points(*args, **kwargs)
-                    reference_points_times_local.append(time.time() - t_ref0)
+                        t0 = time.time()
+                        result = original_encode_prompt(*args, **kwargs)
+                        encode_times.append(time.time() - t0)
                     return result
-                
-                def timed_transformer_encoder_forward(*enc_args, **enc_kwargs):
-                    t_enc0 = time.time()
-                    result = original_transformer_encoder_forward(*enc_args, **enc_kwargs)
-                    local_transformer_times.append(time.time() - t_enc0)
-                    return result
-                
-                model.transformer.encoder.forward = timed_transformer_encoder_forward
-                model.transformer.encoder._prepare_multilevel_features = timed_prepare_multilevel
-                model.transformer.encoder.get_reference_points = timed_get_reference_points
-                try:
+
+                def timed_run_encoder(*args, **kwargs):
+                    if use_cuda_events:
+                        e0 = _evt()
+                    else:
+                        t0 = time.time()
                     result = original_run_encoder(*args, **kwargs)
+                    if use_cuda_events:
+                        e1 = _evt()
+                        encoder_times.append((e0, e1))
+                    else:
+                        encoder_times.append(time.time() - t0)
+                    return result
+
+                def timed_run_decoder(*args, **kwargs):
+                    if use_cuda_events:
+                        e0 = _evt()
+                        result = original_run_decoder(*args, **kwargs)
+                        e1 = _evt()
+                        decoder_times.append((e0, e1))
+                    else:
+                        t0 = time.time()
+                        result = original_run_decoder(*args, **kwargs)
+                        decoder_times.append(time.time() - t0)
+                    return result
+
+                def timed_run_segmentation_heads(*args, **kwargs):
+                    if use_cuda_events:
+                        e0 = _evt()
+                        result = original_run_segmentation_heads(*args, **kwargs)
+                        e1 = _evt()
+                        seg_times.append((e0, e1))
+                    else:
+                        t0 = time.time()
+                        result = original_run_segmentation_heads(*args, **kwargs)
+                        seg_times.append(time.time() - t0)
+                    return result
+
+                model._encode_prompt = timed_encode_prompt
+                model._run_encoder = timed_run_encoder
+                model._run_decoder = timed_run_decoder
+                model._run_segmentation_heads = timed_run_segmentation_heads
+
+                try:
+                    outputs = model.forward_grounding(
+                        backbone_out=backbone_out,
+                        find_input=find_input,
+                        geometric_prompt=geometric_prompt,
+                        find_target=None,
+                    )
                 finally:
-                    model.transformer.encoder.forward = original_transformer_encoder_forward
-                    model.transformer.encoder._prepare_multilevel_features = original_prepare_multilevel
-                    model.transformer.encoder.get_reference_points = original_get_reference_points
-                    # Restore original layer forwards
-                    for layer_idx, orig_forward in original_layer_forwards:
-                        model.transformer.encoder.layers[layer_idx].forward = orig_forward
-                
-                if use_cuda_events:
-                    e1 = _evt()
-                    encoder_times.append((e0, e1))
-                else:
-                    encoder_times.append(time.time() - t0)
-                if local_transformer_times:
-                    transformer_encoder_times.extend(local_transformer_times)
-                if layer_times:
-                    encoder_layer_times.extend(layer_times)
-                if prepare_times:
-                    encoder_prepare_times.extend(prepare_times)
-                if reference_points_times_local:
-                    reference_points_times.extend(reference_points_times_local)
-                return result
-            
-            def timed_run_decoder(*args, **kwargs):
-                if use_cuda_events:
-                    e0 = _evt()
-                    result = original_run_decoder(*args, **kwargs)
-                    e1 = _evt()
-                    decoder_times.append((e0, e1))
-                else:
-                    t0 = time.time()
-                    result = original_run_decoder(*args, **kwargs)
-                    decoder_times.append(time.time() - t0)
-                return result
-            
-            def timed_run_segmentation_heads(*args, **kwargs):
-                if use_cuda_events:
-                    e0 = _evt()
-                    result = original_run_segmentation_heads(*args, **kwargs)
-                    e1 = _evt()
-                    seg_times.append((e0, e1))
-                else:
-                    t0 = time.time()
-                    result = original_run_segmentation_heads(*args, **kwargs)
-                    seg_times.append(time.time() - t0)
-                return result
-            
-            model._encode_prompt = timed_encode_prompt
-            model._run_encoder = timed_run_encoder
-            model._run_decoder = timed_run_decoder
-            model._run_segmentation_heads = timed_run_segmentation_heads
-            
-            try:
+                    # Restore original methods
+                    model._encode_prompt = original_encode_prompt
+                    model._run_encoder = original_run_encoder
+                    model._run_decoder = original_run_decoder
+                    model._run_segmentation_heads = original_run_segmentation_heads
+            else:
+                # Fast path: no monkeypatching, no profiling.
                 outputs = model.forward_grounding(
                     backbone_out=backbone_out,
                     find_input=find_input,
                     geometric_prompt=geometric_prompt,
                     find_target=None,
                 )
-            finally:
-                # Restore original methods
-                model._encode_prompt = original_encode_prompt
-                model._run_encoder = original_run_encoder
-                model._run_decoder = original_run_decoder
-                model._run_segmentation_heads = original_run_segmentation_heads
             
             # Process logits and presence scores
             logits = outputs["pred_logits"]
@@ -855,45 +719,50 @@ def compute_weight_map_from_lang_text_batch(
             layer_avg_times = {idx: layer_time_sums[idx] / layer_counts[idx] 
                               for idx in layer_time_sums}
         
-        logger.info(
-            f"[SAM3 Latency] Total={t_total_elapsed:.3f}s | "
-            f"set_image={t_set_img_elapsed:.3f}s | "
-            f"forward_text={t_text_elapsed:.3f}s | "
-            f"forward_grounding(x{num_thresholds})={t_forward_total:.3f}s "
-            f"(avg={t_forward_total/num_thresholds:.3f}s/thr) | "
-            f"other={t_total_elapsed - t_set_img_elapsed - t_text_elapsed - t_forward_total:.3f}s"
-        )
-        if use_cuda_events and (set_img_pre is not None or set_img_fwd is not None):
+        if enable_profiling:
+            import logging
+            logger = logging.getLogger(__name__)
             logger.info(
-                f"[SAM3 set_image breakdown] preprocess={float(set_img_pre or 0.0):.3f}s | "
-                f"backbone_forward={float(set_img_fwd or 0.0):.3f}s"
+                f"[SAM3 Latency] Total={t_total_elapsed:.3f}s | "
+                f"set_image={t_set_img_elapsed:.3f}s | "
+                f"forward_text={t_text_elapsed:.3f}s | "
+                f"forward_grounding(x{num_thresholds})={t_forward_total:.3f}s "
+                f"(avg={t_forward_total/num_thresholds:.3f}s/thr) | "
+                f"other={t_total_elapsed - t_set_img_elapsed - t_text_elapsed - t_forward_total:.3f}s"
             )
-        # Note: avg_transformer_encoder is computed from time.time() monkeypatch timings and can be
-        # misleading under CUDA async execution. When using CUDA-event timing, omit it.
-        if use_cuda_events:
-            logger.info(
-                f"[SAM3 forward_grounding breakdown] "
-                f"encode_prompt={avg_encode:.3f}s | "
-                f"run_encoder={avg_encoder:.3f}s | "
-                f"run_decoder={avg_decoder:.3f}s | "
-                f"run_segmentation_heads={avg_seg:.3f}s"
-            )
-        else:
-            logger.info(
-                f"[SAM3 forward_grounding breakdown] "
-                f"encode_prompt={avg_encode:.3f}s | "
-                f"run_encoder={avg_encoder:.3f}s "
-                f"(transformer.encoder={avg_transformer_encoder:.3f}s) | "
-                f"run_decoder={avg_decoder:.3f}s | "
-                f"run_segmentation_heads={avg_seg:.3f}s"
-            )
+            if use_cuda_events and (set_img_pre is not None or set_img_fwd is not None):
+                logger.info(
+                    f"[SAM3 set_image breakdown] preprocess={float(set_img_pre or 0.0):.3f}s | "
+                    f"backbone_forward={float(set_img_fwd or 0.0):.3f}s"
+                )
+        if enable_profiling:
+            import logging
+            logger = logging.getLogger(__name__)
+            # Note: avg_transformer_encoder relies on time.time monkeypatch timings.
+            if use_cuda_events:
+                logger.info(
+                    f"[SAM3 forward_grounding breakdown] "
+                    f"encode_prompt={avg_encode:.3f}s | "
+                    f"run_encoder={avg_encoder:.3f}s | "
+                    f"run_decoder={avg_decoder:.3f}s | "
+                    f"run_segmentation_heads={avg_seg:.3f}s"
+                )
+            else:
+                logger.info(
+                    f"[SAM3 forward_grounding breakdown] "
+                    f"encode_prompt={avg_encode:.3f}s | "
+                    f"run_encoder={avg_encoder:.3f}s "
+                    f"(transformer.encoder={avg_transformer_encoder:.3f}s) | "
+                    f"run_decoder={avg_decoder:.3f}s | "
+                    f"run_segmentation_heads={avg_seg:.3f}s"
+                )
         avg_prepare = sum(encoder_prepare_times) / len(encoder_prepare_times) if encoder_prepare_times else 0.0
         avg_reference_points = sum(reference_points_times) / len(reference_points_times) if reference_points_times else 0.0
         total_layer_time = sum(layer_avg_times.values()) if layer_avg_times else 0.0
         other_encoder_time = avg_transformer_encoder - total_layer_time - avg_prepare - avg_reference_points
 
         # Detailed encoder breakdown relies on time.time-based monkeypatch timings.
-        if (not use_cuda_events) and (layer_avg_times or encoder_prepare_times or reference_points_times):
+        if enable_profiling and (not use_cuda_events) and (layer_avg_times or encoder_prepare_times or reference_points_times):
             parts = []
             if avg_prepare > 0:
                 parts.append(f"prepare={avg_prepare:.3f}s")
@@ -904,6 +773,8 @@ def compute_weight_map_from_lang_text_batch(
                 parts.append(layer_times_str)
             if other_encoder_time > 0.001:
                 parts.append(f"other={other_encoder_time:.3f}s")
+            import logging
+            logger = logging.getLogger(__name__)
             logger.info(f"[SAM3 encoder breakdown] {' | '.join(parts)}")
             
             # Log detailed prepare breakdown if prepare takes significant time
