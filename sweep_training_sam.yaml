@@ -13,7 +13,7 @@ parameters:
     values: [0.01, 0.1, 1.0, 10.0]
   # Optional: also search other SAM3 parameters
   batch_size:
-    value: 32
+    values: [16]
     
   custom_loss.sam3_view:
      values: ["both","static", "gripper"]
