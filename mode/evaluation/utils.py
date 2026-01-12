@@ -495,6 +495,68 @@ def reconstruct_frame_for_video(model, rgb_static_tensor):
     recon_frame = recon[0] if recon.dim() == 4 else recon.squeeze(0)
     return recon_frame
 
+def reconstruct_frame_for_video_dual_msillm(model, rgb_tensor, sensor_name="rgb_static"):
+    """
+    Reconstruct a single frame using MS-ILLM for video saving (supports dual MS-ILLM).
+    
+    Args:
+        model: Model with msillm_model_rgb_static or msillm_model_rgb_gripper attributes
+        rgb_tensor: RGB tensor in [0, 1] range [1, 1, C, H, W] or [1, C, H, W]
+        sensor_name: 'rgb_static' or 'rgb_gripper'
+    
+    Returns:
+        Reconstructed frame tensor [C, H, W] on GPU, or None if MS-ILLM not available
+    """
+    msillm_attr = f"msillm_model_{sensor_name}"
+    msillm = getattr(model, msillm_attr, None)
+    if msillm is None:
+        return None
+    
+    if not hasattr(msillm, "compress") or not hasattr(msillm, "decompress"):
+        return None
+    
+    # Ensure correct shape: [1, 1, C, H, W] (B, T, C, H, W format)
+    if rgb_tensor.dim() == 4:
+        rgb_tensor = rgb_tensor.unsqueeze(1)  # [1, C, H, W] -> [1, 1, C, H, W]
+    elif rgb_tensor.dim() == 5:
+        pass  # Already [B, T, C, H, W]
+    else:
+        return None  # Unexpected shape
+    
+    # Input is already in [0, 1] range (Normalize transform removed)
+    x01 = rgb_tensor.clamp(0.0, 1.0)
+    b, t, c, h, w = x01.shape
+    x01_bt = x01.reshape(b * t, c, h, w)
+    
+    # Check if resize should be skipped
+    skip_resize = getattr(model, "_skip_resize_for_reconstruction", False)
+    if skip_resize:
+        x01_bt_resized = x01_bt
+    else:
+        # MS-ILLM requires images to be divisible by 64
+        factor = 64
+        if h % factor != 0 or w % factor != 0:
+            new_h = ((h + factor - 1) // factor) * factor
+            new_w = ((w + factor - 1) // factor) * factor
+            x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        else:
+            x01_bt_resized = x01_bt
+    
+    # Compress/Decompress (this triggers LatentCaptureWrapper if present)
+    with torch.no_grad():
+        compressed = msillm.compress(x01_bt_resized, force_cpu=False)
+        recon_resized = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
+    
+    # Resize back to original size if resize was done
+    if recon_resized.shape[2:] != (h, w):
+        recon = F.interpolate(recon_resized, size=(h, w), mode='bilinear', align_corners=False)
+    else:
+        recon = recon_resized
+    
+    # Extract single frame: [C, H, W]
+    recon_frame = recon[0] if recon.dim() == 4 else recon.squeeze(0)
+    return recon_frame
+
 def patch_modeagent_embed_visual_obs_for_msillm(model, compress_gripper: bool = True, compress_rgb: bool = True, skip_resize: bool = False):
     msillm = getattr(model, "msillm_model", None)
     if msillm is None:

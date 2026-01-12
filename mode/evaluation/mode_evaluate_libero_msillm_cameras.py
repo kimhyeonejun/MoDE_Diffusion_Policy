@@ -27,7 +27,13 @@ if libero_repo_dir.exists():
     current_pythonpath = os.environ.get("PYTHONPATH", "")
     os.environ["PYTHONPATH"] = f"{libero_repo_dir}:{current_pythonpath}" if current_pythonpath else str(libero_repo_dir)
 
-from mode.evaluation.utils import get_msillm_mode_and_env, reconstruct_frame_for_video, load_msillm_from_torchhub, get_device, move_model_to_device
+from mode.evaluation.utils import (
+    get_msillm_mode_and_env,
+    load_msillm_from_torchhub,
+    get_device,
+    move_model_to_device,
+    reconstruct_frame_for_video_dual_msillm,
+)
 import torch.nn.functional as F
 from mode.evaluation.multistep_sequences import get_sequences
 from mode.utils.bpp_utils import (
@@ -40,6 +46,19 @@ from libero.libero.benchmark import get_benchmark
 from libero.libero.envs import OffScreenRenderEnv
 from libero.lifelong.utils import get_task_embs
 
+# Import common functions from mode_evaluate_libero_msillm
+from mode.evaluation.mode_evaluate_libero_msillm import (
+    LatentCaptureWrapper,
+    get_log_dir,
+    _prepare_video_frame,
+    _instantiate_transforms,
+    _load_transforms,
+    _get_device_config,
+    _resolve_checkpoint_path,
+    _sanitize_checkpoint_path,
+    _setup_wandb,
+    EvaluateLibero as BaseEvaluateLibero,
+)
 
 log_print = logging.getLogger(__name__)
 
@@ -49,16 +68,6 @@ def _get_bpp_wrapper(model, sensor_name="rgb_static"):
     # For dual MS-ILLM setup, wrappers are stored per sensor
     wrapper_attr = f"_bpp_wrapper_{sensor_name}"
     wrapper = getattr(model, wrapper_attr, None)
-    if wrapper is None:
-        # Fallback to old single MS-ILLM wrapper
-        wrapper = getattr(model, "_bpp_wrapper", None)
-        if wrapper is None:
-            msillm_model = getattr(model, f"msillm_model_{sensor_name}", None)
-            if msillm_model is None:
-                msillm_model = getattr(model, "msillm_model", None)
-            if msillm_model is not None:
-                if hasattr(msillm_model, "compress") and isinstance(msillm_model.compress, LatentCaptureWrapper):
-                    wrapper = msillm_model.compress
     return wrapper
 
 
@@ -79,386 +88,12 @@ def _calculate_bpp_from_latents(model, data, sensors):
     return bpp_dict
 
 
-def _reconstruct_frame_for_video_dual_msillm(model, rgb_tensor, sensor_name="rgb_static"):
-    """
-    Reconstruct a single frame using MS-ILLM for video saving (supports dual MS-ILLM).
-    
-    Args:
-        model: Model with msillm_model_rgb_static or msillm_model_rgb_gripper attributes
-        rgb_tensor: RGB tensor in [0, 1] range [1, 1, C, H, W] or [1, C, H, W]
-        sensor_name: 'rgb_static' or 'rgb_gripper'
-    
-    Returns:
-        Reconstructed frame tensor [C, H, W] on GPU, or None if MS-ILLM not available
-    """
-    msillm_attr = f"msillm_model_{sensor_name}"
-    msillm = getattr(model, msillm_attr, None)
-    if msillm is None:
-        # Fallback to single MS-ILLM
-        msillm = getattr(model, "msillm_model", None)
-    
-    if msillm is None:
-        return None
-    
-    if not hasattr(msillm, "compress") or not hasattr(msillm, "decompress"):
-        return None
-    
-    # Ensure correct shape: [1, 1, C, H, W] (B, T, C, H, W format)
-    if rgb_tensor.dim() == 4:
-        rgb_tensor = rgb_tensor.unsqueeze(1)  # [1, C, H, W] -> [1, 1, C, H, W]
-    elif rgb_tensor.dim() == 5:
-        pass  # Already [B, T, C, H, W]
-    else:
-        return None  # Unexpected shape
-    
-    # Input is already in [0, 1] range (Normalize transform removed)
-    x01 = rgb_tensor.clamp(0.0, 1.0)
-    b, t, c, h, w = x01.shape
-    x01_bt = x01.reshape(b * t, c, h, w)
-    
-    # Check if resize should be skipped
-    skip_resize = getattr(model, "_skip_resize_for_reconstruction", False)
-    if skip_resize:
-        x01_bt_resized = x01_bt
-    else:
-        # MS-ILLM requires images to be divisible by 64
-        factor = 64
-        if h % factor != 0 or w % factor != 0:
-            new_h = ((h + factor - 1) // factor) * factor
-            new_w = ((w + factor - 1) // factor) * factor
-            x01_bt_resized = F.interpolate(x01_bt, size=(new_h, new_w), mode='bilinear', align_corners=False)
-        else:
-            x01_bt_resized = x01_bt
-    
-    # Compress/Decompress (this triggers LatentCaptureWrapper if present)
-    with torch.no_grad():
-        compressed = msillm.compress(x01_bt_resized, force_cpu=False)
-        recon_resized = msillm.decompress(compressed, force_cpu=False).clamp(0.0, 1.0)
-    
-    # Resize back to original size if resize was done
-    if recon_resized.shape[2:] != (h, w):
-        recon = F.interpolate(recon_resized, size=(h, w), mode='bilinear', align_corners=False)
-    else:
-        recon = recon_resized
-    
-    # Extract single frame: [C, H, W]
-    recon_frame = recon[0] if recon.dim() == 4 else recon.squeeze(0)
-    return recon_frame
+# _prepare_video_frame, LatentCaptureWrapper, get_log_dir are imported from mode_evaluate_libero_msillm
 
 
-def _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_static', data=None):
-    """Prepare video frame from model or observation.
-    
-    Args:
-        model: Model with reconstructed frame tensors
-        obs: Environment observation dictionary
-        store_reconstructed: Whether to use reconstructed frames
-        sensor_name: 'rgb_static' or 'rgb_gripper'
-        data: Optional transformed data dictionary (to use transforms-processed images)
-    
-    Returns:
-        numpy array frame in BGR format, or None if no frame available
-    """
-    if store_reconstructed:
-        # Check for sensor-specific reconstructed frame
-        tensor_attr = f'_last_reconstructed_frame_tensor_{sensor_name}'
-        if hasattr(model, tensor_attr):
-            recon_frame = getattr(model, tensor_attr)
-            if recon_frame is not None:
-                try:
-                    # Ensure tensor is on CPU and detached
-                    if isinstance(recon_frame, torch.Tensor):
-                        recon_frame = recon_frame.detach().cpu()
-                    # Handle different tensor shapes: [C, H, W] or [1, C, H, W] or [B, C, H, W]
-                    if recon_frame.dim() == 4:
-                        recon_frame = recon_frame[0]  # [1, C, H, W] -> [C, H, W]
-                    elif recon_frame.dim() == 3:
-                        pass  # Already [C, H, W]
-                    else:
-                        print(f"[Video] Warning: Unexpected reconstructed frame shape for {sensor_name}: {recon_frame.shape}")
-                        recon_frame = recon_frame[0] if recon_frame.dim() > 3 else recon_frame
-                    
-                    # Clamp to [0, 1] range and convert to uint8
-                    if recon_frame.max() <= 1.0:
-                        rgb_recon_np = (recon_frame.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    else:
-                        rgb_recon_np = recon_frame.permute(1, 2, 0).numpy().astype(np.uint8)
-                    rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
-                    # Debug: log first frame usage
-                    if not hasattr(model, '_video_frame_debug_logged'):
-                        print(f"[Video] Using stored reconstructed frame for {sensor_name}: shape={rgb_recon_np.shape}, range=[{rgb_recon_np.min()}, {rgb_recon_np.max()}]")
-                        model._video_frame_debug_logged = True
-                    return rgb_recon_np[..., ::-1]  # RGB to BGR
-                except Exception as e:
-                    print(f"[Video] Warning: Failed to process reconstructed frame for {sensor_name}: {e}")
-                    import traceback
-                    traceback.print_exc()
-        # If reconstructed frame is not available, try to reconstruct on-the-fly if we have the data and MS-ILLM model
-        if store_reconstructed and data is not None and sensor_name in data.get("rgb_obs", {}):
-            # Try to reconstruct on-the-fly for this frame
-            try:
-                recon_frame = _reconstruct_frame_for_video_dual_msillm(model, data["rgb_obs"][sensor_name], sensor_name)
-                if recon_frame is not None:
-                    # Process the reconstructed frame
-                    if isinstance(recon_frame, torch.Tensor):
-                        recon_frame = recon_frame.detach().cpu()
-                    if recon_frame.dim() == 4:
-                        recon_frame = recon_frame[0]
-                    elif recon_frame.dim() == 3:
-                        pass
-                    if recon_frame.max() <= 1.0:
-                        rgb_recon_np = (recon_frame.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-                    else:
-                        rgb_recon_np = recon_frame.permute(1, 2, 0).numpy().astype(np.uint8)
-                    rgb_recon_np = np.rot90(rgb_recon_np, k=2, axes=(0, 1))
-                    # Debug: log on-the-fly reconstruction
-                    if not hasattr(model, '_video_frame_debug_logged'):
-                        print(f"[Video] Using on-the-fly reconstructed frame for {sensor_name}: shape={rgb_recon_np.shape}, range=[{rgb_recon_np.min()}, {rgb_recon_np.max()}]")
-                        model._video_frame_debug_logged = True
-                    return rgb_recon_np[..., ::-1]  # RGB to BGR
-            except Exception as e:
-                print(f"[Video] Warning: Failed to reconstruct on-the-fly for {sensor_name}: {e}")
-                import traceback
-                traceback.print_exc()
-    
-    # Use transforms-processed image if available (already in [0, 1] range, no denormalize needed)
-    if data is not None and sensor_name in data.get("rgb_obs", {}):
-        try:
-            img_tensor = data["rgb_obs"][sensor_name].squeeze(0)[0]  # [1, T, C, H, W] -> [C, H, W]
-            frame = (img_tensor.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            frame = np.rot90(frame, k=2, axes=(0, 1))
-            return frame[..., ::-1]  # RGB to BGR
-        except Exception as e:
-            print(f"[Video] Warning: Failed to process data frame for {sensor_name}: {e}")
-    
-    # Fallback: Use original observation
-    try:
-        if sensor_name == 'rgb_static' and 'agentview_image' in obs:
-            frame = obs['agentview_image']
-        elif sensor_name == 'rgb_gripper' and 'robot0_eye_in_hand_image' in obs:
-            frame = obs['robot0_eye_in_hand_image']
-        else:
-            return None
-        
-        if isinstance(frame, np.ndarray):
-            frame = np.rot90(frame, k=2, axes=(0, 1))
-            return frame[..., ::-1] if frame.shape[2] == 3 else frame  # RGB to BGR if needed
-    except Exception as e:
-        print(f"[Video] Warning: Failed to process observation frame for {sensor_name}: {e}")
-    
-    return None
-
-
-class LatentCaptureWrapper:
-    """Simple wrapper to capture latents for BPP calculation."""
-    def __init__(self, original_method):
-        self.original = original_method
-        self.latents = []
-        self.call_count = 0
-    
-    def __call__(self, *args, **kwargs):
-        latent = self.original(*args, **kwargs)
-        self.latents.append(latent)
-        self.call_count += 1
-        return latent
-    
-    def clear(self):
-        """Clear captured latents."""
-        self.latents = []
-        self.call_count = 0
-
-def get_log_dir(log_dir, checkpoint_name=None):
-    """
-    Resolve evaluation output directory.
-    
-    Behavior:
-    - If `checkpoint_name` is provided: use it directly as the directory name (without base_dir prefix).
-      This avoids the "outputs/eval/outputs/eval/..." nested structure.
-    - If `checkpoint_name` is not provided: use Hydra's run dir (if active), else `log_dir`,
-      else default under the repo.
-    """
-    hydra_output_dir = Path.cwd()
-    running_under_hydra = (hydra_output_dir / ".hydra").exists()
-
-    # If checkpoint_name is provided, use it directly (without base_dir prefix)
-    if checkpoint_name:
-        ckpt_path = Path(checkpoint_name)
-        # Avoid mirroring absolute paths into the output directory tree.
-        if ckpt_path.is_absolute():
-            ckpt_subdir = Path(ckpt_path.stem)
-        else:
-            ckpt_subdir = ckpt_path.with_suffix("")  # keeps subdirectories, drops extension
-        log_dir = Path(ckpt_subdir)
-    else:
-        # Choose base directory only when checkpoint_name is not provided
-        if log_dir is not None:
-            base_dir = Path(log_dir)
-        elif running_under_hydra:
-            base_dir = hydra_output_dir
-        else:
-            base_dir = Path(__file__).parents[3] / "outputs" / "libero_eval"
-        log_dir = base_dir
-
-    os.makedirs(log_dir, exist_ok=True)
-    
-    print(f"logging to {log_dir}")
-    return log_dir
-
-
-class EvaluateLibero:
-    def __init__(
-        self,
-        model,
-        transforms,
-        log_dir,
-        benchmark_name,
-        num_sequences,
-        max_steps,
-        num_videos,
-        n_eval,
-        task_embedding_format,
-        device,
-    ):
-        self.model = model
-        self.transforms = transforms
-        self.log_dir = log_dir
-
-        # Normalize device to torch.device
-        if device == "cpu":
-            self.device = torch.device("cpu")
-        else:
-            self.device = torch.device(device)
-        self.task_order = 0
-        self.bddl_folder = get_libero_path("bddl_files")
-        self.init_states_folder = get_libero_path("init_states")
-        self.task_embedding_format = task_embedding_format
-        self.benchmark_name = benchmark_name
-        self.benchmark_dict = benchmark.get_benchmark_dict()
-        self.benchmark_instance = self.benchmark_dict[self.benchmark_name]()
-        self.num_tasks = self.benchmark_instance.get_num_tasks()
-        self.num_videos = num_videos
-        self.task_names = self.benchmark_instance.get_task_names()
-        self.benchmark = get_benchmark(self.benchmark_name)(self.task_order)
-        self.n_eval = n_eval
-        self.img_h = 224
-        self.img_w = 224
-        self.num_sequences = num_sequences
-        self.max_steps = max_steps
-        self.eval_sequences = None
-        self.cfg = {}
-        self.descriptions = []
-        
-        # BPP statistics tracking
-        self.bpp_stats = {}
-        
-        # First, collect all descriptions
-        for i in range(self.num_tasks):
-            self.descriptions.append(self.benchmark_instance.get_task(i).language)
-
-        # Now create cfg and task embeddings with descriptions available
-        self.create_cfg_for_libero(self.task_embedding_format)
-        
-        # Set task embeddings
-        task_embs = getattr(self, 'task_embs', None)
-        if task_embs is None:
-            task_embs = get_task_embs(self.cfg, self.descriptions)
-        self.benchmark_instance.set_task_embs(task_embs)
-
-        self.all_tasks = list(range(self.benchmark_instance.n_tasks))
-
-    def setup(self) -> None:
-        if self.benchmark is None:
-            self.eval_sequences = get_sequences(self.num_sequences)
-            self.benchmark = get_benchmark(self.benchmark_name)(self.eval_sequences)
-
-    def start(self) -> None:
-
-        successes = self.evaluate_policy(self.model, store_video=self.num_videos)
-
-        result_array = sum(successes) / len(successes)
-
-        # Print results to console
-        print(f"\n{'='*60}")
-        print(f"Evaluation Results:")
-        print(f"{'='*60}")
-        print(f"Average success rate: {result_array:.4f} ({result_array*100:.2f}%)")
-        print(f"Number of tasks: {len(successes)}")
-        print(f"\nPer-task success rates:")
-        for success, task_name in zip(successes, self.task_names):
-            print(f"  {task_name}: {success:.4f} ({success*100:.2f}%)")
-        print(f"{'='*60}\n")
-
-        # Save results to JSON file
-        results_dict = {
-            "average_success_rate": float(result_array),
-            "num_tasks": len(successes),
-            "per_task_success": {
-                task_name: float(success) for success, task_name in zip(successes, self.task_names)
-            }
-        }
-        results_file = self.log_dir / "results.json"
-        with open(results_file, 'w') as f:
-            json.dump(results_dict, f, indent=2)
-        print(f"Results saved to {results_file}")
-
-        # Also log to logger
-        log_print.info(f"eval_lh/avg_seq_len success rate {torch.tensor(result_array)}")
-        if wandb.run is not None:
-            wandb.log({"eval_lh/avg_seq_len": torch.tensor(result_array)})
-
-        for success, task_name in zip(successes, self.task_names):
-            log_print.info(f"eval_lh/sr_{task_name} with success {success}")
-            if wandb.run is not None:
-                wandb.log({f"eval_lh/sr_{task_name}": success})
-        
-        # Log BPP statistics if available
-        if self.bpp_stats and len(self.bpp_stats) > 0:
-            avg_bpp = compute_average_bpp(self.bpp_stats)
-            print(f"\n{'='*60}")
-            print(f"BPP Statistics:")
-            print(f"{'='*60}")
-            for key, bpp_value in avg_bpp.items():
-                print(f"  {key}: {bpp_value:.4f} bpp")
-                log_print.info(f"bpp/{key}: {bpp_value:.4f}")
-                if wandb.run is not None:
-                    wandb.log({f"bpp/{key}": bpp_value})
-            print(f"{'='*60}\n")
-            
-            # Add to results dict
-            results_dict["bpp"] = {k: float(v) for k, v in avg_bpp.items()}
-            with open(results_file, 'w') as f:
-                json.dump(results_dict, f, indent=2)
-
-    def evaluate_policy(self, model, store_video=False):
-        successes = []
-        
-        print(f"\n{'='*60}")
-        print(f"Starting evaluation of {len(self.all_tasks)} tasks")
-        print(f"{'='*60}\n")
-
-        for idx in self.all_tasks:  # Distribute tasks across GPUs
-            task_name = self.task_names[idx]
-            task_i = self.benchmark_instance.get_task(idx)
-            task_emb = self.benchmark_instance.task_embs[idx]
-            
-            task_str = f"k{self.all_tasks[-1]}_p{idx}"
-            log_print.info(f"starting to evaluate: {task_name}")
-            print(f"\n[{idx+1}/{len(self.all_tasks)}] Evaluating: {task_name}")
-            print(f"Task description: {task_i.language}")
-            success_rate = self.evaluate_task(model, task_i, task_emb, task_str, idx, store_video=store_video)
-            successes.append(success_rate)
-            
-            # Print immediate result for this task
-            print(f"\n✓ Task {idx+1}/{len(self.all_tasks)} completed: {task_name}")
-            print(f"  Success rate: {success_rate:.2%} ({success_rate*self.n_eval:.0f}/{self.n_eval})")
-            
-            # Print running average
-            if len(successes) > 0:
-                avg_success = sum(successes) / len(successes)
-                print(f"  Running average: {avg_success:.2%} across {len(successes)} tasks")
-            print()
-
-        return successes
+class EvaluateLibero(BaseEvaluateLibero):
+    # __init__, setup, start, evaluate_policy are inherited from BaseEvaluateLibero
+    # Only evaluate_task is overridden for dual MS-ILLM support
 
     def evaluate_task(self, model, task_i, task_emb, task_str, idx, sim_states=None, store_video=0):
         # Check for BPP wrappers (supports dual MS-ILLM)
@@ -553,27 +188,15 @@ class EvaluateLibero:
                     and model._store_reconstructed_frame):
                     # Reconstruct rgb_static if available and compress_rgb is enabled
                     if "rgb_static" in data.get("rgb_obs", {}) and compress_rgb:
-                        # Use dual MS-ILLM aware reconstruction function
-                        recon_frame = _reconstruct_frame_for_video_dual_msillm(model, data["rgb_obs"]["rgb_static"], "rgb_static")
-                        if recon_frame is None:
-                            # Fallback to original function
-                            recon_frame = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_static"])
+                        recon_frame = reconstruct_frame_for_video_dual_msillm(model, data["rgb_obs"]["rgb_static"], "rgb_static")
                         if recon_frame is not None:
                             model._last_reconstructed_frame_tensor_rgb_static = recon_frame.detach().clone()
-                            if steps == 1:  # Debug log only for first step
-                                print(f"[Video] Stored reconstructed frame for rgb_static: shape={recon_frame.shape}, dtype={recon_frame.dtype}, min={recon_frame.min():.3f}, max={recon_frame.max():.3f}")
                     
                     # Reconstruct rgb_gripper if available and compress_gripper is enabled
                     if "rgb_gripper" in data.get("rgb_obs", {}) and compress_gripper:
-                        # Use dual MS-ILLM aware reconstruction function
-                        recon_frame_gripper = _reconstruct_frame_for_video_dual_msillm(model, data["rgb_obs"]["rgb_gripper"], "rgb_gripper")
-                        if recon_frame_gripper is None:
-                            # Fallback to original function
-                            recon_frame_gripper = reconstruct_frame_for_video(model, data["rgb_obs"]["rgb_gripper"])
+                        recon_frame_gripper = reconstruct_frame_for_video_dual_msillm(model, data["rgb_obs"]["rgb_gripper"], "rgb_gripper")
                         if recon_frame_gripper is not None:
                             model._last_reconstructed_frame_tensor_rgb_gripper = recon_frame_gripper.detach().clone()
-                            if steps == 1:  # Debug log only for first step
-                                print(f"[Video] Stored reconstructed frame for rgb_gripper: shape={recon_frame_gripper.shape}, dtype={recon_frame_gripper.dtype}, min={recon_frame_gripper.min():.3f}, max={recon_frame_gripper.max():.3f}")
 
                 # Calculate BPP from captured latents (supports dual MS-ILLM)
                 sensors = []
@@ -590,21 +213,6 @@ class EvaluateLibero:
                 if store_video_this_rollout:
                     store_reconstructed = (hasattr(model, '_store_reconstructed_frame') 
                                          and model._store_reconstructed_frame)
-                    # Debug: log settings (only first step)
-                    if steps == 1:
-                        print(f"[Video] Step {steps}: store_reconstructed={store_reconstructed}, compress_rgb={compress_rgb}, compress_gripper={compress_gripper}")
-                        print(f"[Video] Model has _store_reconstructed_frame: {hasattr(model, '_store_reconstructed_frame')}")
-                        if hasattr(model, '_store_reconstructed_frame'):
-                            print(f"[Video] _store_reconstructed_frame value: {model._store_reconstructed_frame}")
-                        # Check if reconstructed frames are stored
-                        if hasattr(model, '_last_reconstructed_frame_tensor_rgb_static'):
-                            print(f"[Video] _last_reconstructed_frame_tensor_rgb_static exists: {model._last_reconstructed_frame_tensor_rgb_static is not None}")
-                            if model._last_reconstructed_frame_tensor_rgb_static is not None:
-                                print(f"[Video] _last_reconstructed_frame_tensor_rgb_static shape: {model._last_reconstructed_frame_tensor_rgb_static.shape}")
-                        if hasattr(model, '_last_reconstructed_frame_tensor_rgb_gripper'):
-                            print(f"[Video] _last_reconstructed_frame_tensor_rgb_gripper exists: {model._last_reconstructed_frame_tensor_rgb_gripper is not None}")
-                            if model._last_reconstructed_frame_tensor_rgb_gripper is not None:
-                                print(f"[Video] _last_reconstructed_frame_tensor_rgb_gripper shape: {model._last_reconstructed_frame_tensor_rgb_gripper.shape}")
                     
                     # Save static frame (use reconstructed frame if available, otherwise use data)
                     frame_static = _prepare_video_frame(model, obs, store_reconstructed, sensor_name='rgb_static', data=data)
@@ -615,11 +223,6 @@ class EvaluateLibero:
                             frame_static = (img_tensor.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                             frame_static = np.rot90(frame_static, k=2, axes=(0, 1))
                             frame_static = frame_static[..., ::-1]  # RGB to BGR
-                            if steps == 1:
-                                print(f"[Video] Using fallback data frame for rgb_static (reconstructed frame not available)")
-                    else:
-                        if steps == 1:
-                            print(f"[Video] Successfully got frame_static: shape={frame_static.shape}, dtype={frame_static.dtype}, range=[{frame_static.min()}, {frame_static.max()}]")
                     video_frames_static.append(frame_static)
                     
                     # Save gripper frame (use reconstructed frame if available, otherwise use data)
@@ -631,11 +234,6 @@ class EvaluateLibero:
                             frame_gripper = (img_tensor.cpu().permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                             frame_gripper = np.rot90(frame_gripper, k=2, axes=(0, 1))
                             frame_gripper = frame_gripper[..., ::-1]  # RGB to BGR
-                            if steps == 1:
-                                print(f"[Video] Using fallback data frame for rgb_gripper (reconstructed frame not available)")
-                    else:
-                        if steps == 1:
-                            print(f"[Video] Successfully got frame_gripper: shape={frame_gripper.shape}, dtype={frame_gripper.dtype}, range=[{frame_gripper.min()}, {frame_gripper.max()}]")
                     video_frames_gripper.append(frame_gripper)
                 
                 actions = actions.cpu().numpy()
@@ -691,102 +289,7 @@ class EvaluateLibero:
         gc.collect()
         return success_rate
 
-    def create_cfg_for_libero(self, task_embedding_format):
-        self.cfg = DictConfig({
-            'task_embedding_format': task_embedding_format,
-            'data': {'max_word_len': 25},
-            'task_embedding_one_hot_offset': 1
-        })
-
-        self.cfg.policy = OmegaConf.create()
-        self.cfg.policy.language_encoder = OmegaConf.create()
-        self.cfg.policy.language_encoder.network_kwargs = OmegaConf.create()
-
-        # Create task embeddings - same as training: use get_task_embs
-        import torch
-        num_tasks = len(self.descriptions)
-        
-        # Use get_task_embs same as training (libero_dataset.py line 147)
-        task_embs = get_task_embs(self.cfg, self.descriptions)
-        self.task_embs = task_embs
-        print(f"Created {num_tasks} {task_embedding_format} task embeddings using get_task_embs (dim={task_embs[0].shape[0]})")
-        return
-
-
-    def translate_obs_space(self, obs_space):
-
-        translated_dict = {}
-        translated_dict['rgb_obs'] = {}
-        translated_dict['rgb_obs']['rgb_static'] = obs_space['agentview_image']
-        translated_dict["rgb_obs"]['rgb_gripper'] = obs_space['robot0_eye_in_hand_image']
-        translated_dict['robot_obs'] = obs_space['robot0_joint_pos']
-        translated_dict['gripper_states'] = obs_space['robot0_gripper_qpos']
-        translated_dict['depth_obs'] = {}
-
-        return translated_dict
-
-    def apply_transforms(self, data, train=False):
-        for key in data['rgb_obs']:
-            x = data['rgb_obs'][key]
-            if len(x.shape) == 3:
-                x = np.expand_dims(x, axis=0)
-            x = torch.from_numpy(x).byte().permute(0, 3, 1, 2)
-            for transform in self.transforms[key]:
-                x = transform(x)
-            data['rgb_obs'][key] = x.unsqueeze(0).to(self.device)
-        return data
-
-    def process_env_obs(self, env_obs, lang_embed, lang_text=None):
-        return_obs = self.translate_obs_space(env_obs)
-        return_obs = self.apply_transforms(return_obs)
-
-        goal = {}
-        # Ensure lang_text is a list (lang_buffer expects list)
-        if lang_text is not None:
-            if isinstance(lang_text, str):
-                goal['lang_text'] = [lang_text]
-            else:
-                goal['lang_text'] = lang_text
-        else:
-            goal['lang_text'] = None
-        goal['lang'] = lang_embed
-        return return_obs, goal
-
-def _instantiate_transforms(transforms_cfg):
-    transforms = {}
-    for key, t_cfg in transforms_cfg.items():
-        if isinstance(t_cfg, (list, ListConfig)):
-            t_list = [hydra.utils.instantiate(t) for t in t_cfg]
-            transforms[key] = t_list
-        else:
-            transforms[key] = [hydra.utils.instantiate(t_cfg)]
-    return transforms
-
-
-def _load_transforms(loaded_cfg, dm, cfg):
-    """Load transforms with fallback chain."""
-    # Try from loaded config first
-    if hasattr(loaded_cfg, 'datamodule') and hasattr(loaded_cfg.datamodule, 'transforms'):
-        transforms_cfg = loaded_cfg.datamodule.transforms.get("val", loaded_cfg.datamodule.transforms)
-    # Fallback to DM transforms
-    elif hasattr(dm, 'transforms') and dm.transforms is not None:
-        transforms_cfg = dm.transforms.get('val', dm.transforms) if isinstance(dm.transforms, dict) else dm.transforms
-    # Final fallback to current cfg
-    else:
-        transforms_cfg = cfg.datamodule.transforms.get("val", cfg.datamodule.transforms)
-    
-    return _instantiate_transforms(transforms_cfg)
-
-
-def _get_device_config(cfg):
-    """Get device ID and device string from config."""
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible:
-        return 0, "cuda:0"
-    
-    device_id = getattr(cfg, 'device', 0)
-    device_str = device_id if isinstance(device_id, str) else f"cuda:{device_id}"
-    return device_id, device_str
+    # create_cfg_for_libero, translate_obs_space, apply_transforms, process_env_obs are inherited from BaseEvaluateLibero
 
 
 def _load_msillm_from_checkpoint(ckpt_path, device):
@@ -1093,86 +596,7 @@ def _setup_msillm_features(model, cfg):
             print("[Video] Will save original env images to video (no MS-ILLM model)")
 
 
-def _resolve_checkpoint_path(cfg):
-    """Resolve checkpoint path from env var or config."""
-    checkpoint_env = os.environ.get("CHECKPOINT_PATH")
-    if checkpoint_env:
-        print(f"Using checkpoint from environment variable: {checkpoint_env}")
-        cfg.checkpoint = checkpoint_env
-        return
-    
-    # If checkpoint is not specified, use pretrain_chk from config
-    if not cfg.checkpoint or cfg.checkpoint in ("", "null", None):
-            if not hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
-                hydra.initialize("../../conf")
-            base_cfg = hydra.compose(config_name="config_libero_msillm")
-            if hasattr(base_cfg, "pretrain_chk") and base_cfg.pretrain_chk:
-                cfg.checkpoint = base_cfg.pretrain_chk
-                print(f"No checkpoint specified, using pretrained checkpoint: {cfg.checkpoint}")
-            else:
-                raise ValueError("No checkpoint specified and pretrain_chk not found in config")
-
-
-def _sanitize_checkpoint_path(cfg):
-    """Sanitize checkpoint filename to avoid Hydra parsing issues."""
-    if not cfg.checkpoint or "=" not in cfg.checkpoint:
-        return
-    if Path(cfg.checkpoint).is_absolute() or "/" in cfg.checkpoint:
-        return  # Skip for absolute paths or Hugging Face repo IDs
-    
-    sanitized_checkpoint = cfg.checkpoint.replace("=", "-")
-    checkpoint_path = Path(cfg.train_folder) / cfg.checkpoint
-    sanitized_path = Path(cfg.train_folder) / sanitized_checkpoint
-    
-    if sanitized_path.exists():
-        print(f"Using sanitized checkpoint path: {sanitized_checkpoint}")
-        cfg.checkpoint = sanitized_checkpoint
-    elif checkpoint_path.exists():
-        print(f"Warning: Checkpoint filename contains '=' which may cause Hydra parsing issues.")
-        print(f"Consider renaming: {checkpoint_path} -> {sanitized_path}")
-    else:
-        print(f"Warning: Checkpoint not found: {checkpoint_path}")
-
-
-def _setup_wandb(cfg, log_dir):
-    """Setup wandb logger."""
-    import hashlib
-    os.makedirs(log_dir / "wandb", exist_ok=True)
-    checkpoint_stem = Path(cfg.checkpoint).stem
-    
-    # Get wandb config with fallbacks
-    project = OmegaConf.select(cfg, "logger.project", default="mode_libero_eval")
-    group = OmegaConf.select(cfg, "logger.group", default="mode_libero_eval")
-    mode = OmegaConf.select(cfg, "logger.mode", default="online")
-    run_id = OmegaConf.select(cfg, "logger.id", default=None)
-    entity = OmegaConf.select(cfg, "logger.entity", default=None) or cfg.get("wandb_entity", None)
-    
-    # Clean up None/empty values
-    entity = None if entity in ("null", "", None) else entity
-    run_id = None if run_id in ("null", "") else run_id
-    
-    # Generate unique run_id if not provided
-    if run_id is None:
-        unique_str = f"{checkpoint_stem}_{time.time()}"
-        run_id = hashlib.md5(unique_str.encode()).hexdigest()[:16]
-    
-    wandb.init(
-        project=project,
-        entity=entity,
-        name=checkpoint_stem,
-        group=group,
-        config={
-            "checkpoint": cfg.checkpoint,
-            "benchmark_name": cfg.benchmark_name,
-            "num_sequences": cfg.num_sequences,
-            "n_eval": cfg.n_eval,
-            "max_steps": cfg.max_steps,
-        },
-        dir=str(log_dir / "wandb"),
-        mode=mode,
-        id=run_id,
-        resume="allow",
-    )
+# _resolve_checkpoint_path, _sanitize_checkpoint_path, _setup_wandb are imported from mode_evaluate_libero_msillm
 
 @hydra.main(config_path="../../conf", config_name="mode_evaluate_libero_msillm_camera")
 def main(cfg: DictConfig):
@@ -1262,31 +686,14 @@ def main(cfg: DictConfig):
         # Setup MS-ILLM BPP measurement and video settings
         _setup_msillm_features(model, cfg)
         
-        # Store compress_gripper setting on model for video reconstruction
+        # Store compress_gripper and compress_rgb settings on model for video reconstruction
         compress_gripper = OmegaConf.select(loaded_cfg, "msillm.compress_gripper", 
                                            default=OmegaConf.select(cfg, "msillm.compress_gripper", default=True))
-        model._compress_gripper = compress_gripper
-        print(f"[Video] compress_gripper={compress_gripper} (stored on model)")
-        
-        # Store compress_rgb setting on model for video reconstruction
         compress_rgb = OmegaConf.select(loaded_cfg, "msillm.compress_rgb", 
                                         default=OmegaConf.select(cfg, "msillm.compress_rgb", default=True))
+        model._compress_gripper = compress_gripper
         model._compress_rgb = compress_rgb
-        print(f"[Video] compress_rgb={compress_rgb} (stored on model)")
-    
-    # Store compress_gripper setting on model for video reconstruction
-    # Try loaded_cfg first (merged config), then fallback to cfg
-    compress_gripper = OmegaConf.select(loaded_cfg, "msillm.compress_gripper", 
-                                       default=OmegaConf.select(cfg, "msillm.compress_gripper", default=True))
-    model._compress_gripper = compress_gripper
-    print(f"[Video] compress_gripper={compress_gripper} (stored on model)")
-    
-    # Store compress_rgb setting on model for video reconstruction
-    # Try loaded_cfg first (merged config), then fallback to cfg
-    compress_rgb = OmegaConf.select(loaded_cfg, "msillm.compress_rgb", 
-                                    default=OmegaConf.select(cfg, "msillm.compress_rgb", default=True))
-    model._compress_rgb = compress_rgb
-    print(f"[Video] compress_rgb={compress_rgb} (stored on model)")
+        print(f"[Video] compress_gripper={compress_gripper}, compress_rgb={compress_rgb} (stored on model)")
     
     # Ensure DataModule is setup to load statistics
     if not hasattr(dm, 'train_datasets') or not dm.train_datasets:
