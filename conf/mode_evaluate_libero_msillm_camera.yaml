@@ -42,7 +42,8 @@ use_ema_weights: true  # Set to true to use EMA weights instead of regular weigh
 # Base output directory for evaluation artifacts (videos, results.json, wandb dir, etc.)
 # With the current `get_log_dir()` logic, outputs will be saved under:
 #   ${log_dir}/<checkpoint_relative_path_without_suffix>/
-log_dir: outputs/eval
+# Set to null to use Hydra's run.dir instead (avoids duplication)
+log_dir: multiple_camera
 dataset_path: /tmp
 num_videos: 1
 use_reconstructed_video: true  # If true, save MS-ILLM reconstructed images to video; if false, save original env images
