@@ -351,9 +351,22 @@ class TransformerEncoder(nn.Module):
         src_flatten = torch.cat(src_flatten, 1)  # bs, \sum{hxw}, c
         mask_flatten = torch.cat(mask_flatten, 1) if has_mask else None  # bs, \sum{hxw}
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)  # bs, \sum{hxw}, c
-        spatial_shapes = torch.tensor(
-            spatial_shapes, dtype=torch.long, device=src_flatten.device
-        )
+        # spatial_shapes is used for indexing/shape math; keep it integer on the correct device.
+        #
+        # PERF: torch.tensor(python_list, device="cuda") can be a sync point (host->device copy),
+        # and the "wait" time can get attributed here in naive timing. Cache the tensor since
+        # for fixed-resolution inference the feature shapes are constant.
+        device = src_flatten.device
+        shapes_key = tuple(spatial_shapes)
+        cache = getattr(self, "_spatial_shapes_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_spatial_shapes_cache", cache)
+        cached = cache.get((device, shapes_key))
+        if cached is None:
+            cached = torch.tensor(shapes_key, dtype=torch.long, device=device)
+            cache[(device, shapes_key)] = cached
+        spatial_shapes = cached
         level_start_index = torch.cat(
             (
                 spatial_shapes.new_zeros((1,)),

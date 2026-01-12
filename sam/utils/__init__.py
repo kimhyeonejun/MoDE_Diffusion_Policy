@@ -9,7 +9,7 @@ It is *not* part of Meta SAM3 code; it's project glue around:
 from .image_utils import extract_image_from_batch, numpy_to_pil
 from .prompts import build_prompt_candidates
 from .sam3_segmentation import segment_with_sam3_text_prompts
-from .sam3_weight_map import get_sam3_processor, tensor01_to_pil, compute_weight_map
+from .sam3_weight_map import get_sam3_processor, tensor01_to_pil
 from .viz import visualize_sam3_results
 
 __all__ = [
@@ -19,7 +19,6 @@ __all__ = [
     "segment_with_sam3_text_prompts",
     "get_sam3_processor",
     "tensor01_to_pil",
-    "compute_weight_map",
     "visualize_sam3_results",
 ]
 

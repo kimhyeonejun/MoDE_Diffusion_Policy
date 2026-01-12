@@ -95,6 +95,9 @@ custom_loss:
   sam3_view: "both"
   # Confidence threshold for SAM3 segmentation
   sam3_confidence_threshold: 0.05
+  # SAM3 inference dtype (weights + inference compute). Use bf16 to speed up and reduce memory.
+  # Options: "bf16" | "fp32"
+  sam3_infer_dtype: bf16
   # List of thresholds to try for SAM3 segmentation (best result per prompt is selected)
   sam3_thresholds: [0.05]
 

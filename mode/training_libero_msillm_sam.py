@@ -39,9 +39,9 @@ if local_sam3_dir.exists():
 from sam.utils.prompts import build_prompt_candidates
 from sam.utils.sam3_weight_map import (
     get_sam3_processor,
-    compute_weight_map,
     compute_weight_map_from_lang_text_batch,
 )
+from sam.utils.sam3_precomputed import make_sample_key, load_mask_u8, build_weight_map_from_mask
 
 from mode.utils.utils import get_last_checkpoint, initialize_pretrained_weights, print_system_env_info
 from mode.training_utils import (
@@ -192,10 +192,17 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
     alpha = float(cfg_get(cfg, "sam3_alpha", 1.0))
     view = str(cfg_get(cfg, "sam3_view", "both"))  # "static", "gripper", "both"
     conf_thr = float(cfg_get(cfg, "sam3_confidence_threshold", 0.05))
-    thresholds = cfg_get(cfg, "sam3_thresholds", [conf_thr, 0.10, 0.05])
+    # IMPORTANT: default to a *single* threshold when config isn't wired (e.g., when this file
+    # is imported as a module separately from __main__).
+    thresholds = cfg_get(cfg, "sam3_thresholds", [conf_thr])
     if isinstance(thresholds, (float, int)):
         thresholds = [float(thresholds)]
     thresholds = [float(t) for t in thresholds]
+    sam3_resolution = int(cfg_get(cfg, "sam3_resolution", 1008))
+    sam3_infer_dtype = str(cfg_get(cfg, "sam3_infer_dtype", "fp32"))
+    # Default to multiple candidates; tune via `custom_loss.sam3_max_prompts_per_image`.
+    max_prompts_per_image = int(cfg_get(cfg, "sam3_max_prompts_per_image", 3))
+    precomputed_dir = cfg_get(cfg, "sam3_precomputed_dir", None)
 
     # Extract lang_text from batch (per-sample) for SAM3 prompts.
     # Batch can be dict of datasets (train) or a single dataset batch (val-like)
@@ -207,9 +214,18 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
         dataset_batch = batch
     
     lang_text = dataset_batch.get("lang_text", None)
+    idx_field = dataset_batch.get("idx", None)
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    sam3_processor = get_sam3_processor(device=device, logger=logger)
+    sam3_processor = None
+    if not precomputed_dir:
+        sam3_processor = get_sam3_processor(
+            device=device,
+            logger=logger,
+            resolution=sam3_resolution,
+            infer_dtype=sam3_infer_dtype,
+            confidence_threshold=conf_thr,
+        )
 
     # Pull gt/recon from cache populated by forward patch.
     # Shapes are expected to be (B,T,C,H,W) in [0,1].
@@ -220,9 +236,34 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
     if view in ("static", "both") and "rgb_static_gt" in cache and "rgb_static_recon" in cache:
         gt = cache["rgb_static_gt"]
         pred = cache["rgb_static_recon"]
-        wm = compute_weight_map_from_lang_text_batch(
-            gt, sam3_processor, conf_thr, lang_text, thresholds, alpha
-        )
+        if precomputed_dir:
+            # Build per-sample keys and load masks, then expand to (B,T,1,H,W)
+            if idx_field is None:
+                raise KeyError("sam3_precomputed_dir is set, but batch has no 'idx' field")
+            if isinstance(lang_text, str) or lang_text is None:
+                texts = [str(lang_text or "")] * int(gt.shape[0])
+            else:
+                texts = [str(x) for x in list(lang_text)]
+            idxs = idx_field.tolist() if torch.is_tensor(idx_field) else list(idx_field)
+            masks = []
+            for t, j in zip(texts, idxs):
+                key = make_sample_key(t, int(j))
+                m = load_mask_u8(precomputed_dir, view="static", key=key, device=gt.device)
+                if m is None:
+                    raise FileNotFoundError(f"Missing precomputed static mask for key={key} (idx={j})")
+                masks.append(m)
+            mask_hw = torch.stack(masks, dim=0)  # (B,H,W)
+            wm = mask_hw[:, None, None].expand(gt.shape[0], gt.shape[1], 1, gt.shape[3], gt.shape[4]).to(dtype=gt.dtype)
+        else:
+            wm = compute_weight_map_from_lang_text_batch(
+                gt,
+                sam3_processor,
+                conf_thr,
+                lang_text,
+                thresholds,
+                alpha,
+                max_prompts_per_image=max_prompts_per_image,
+            )
         diff = (pred - gt) * wm
         loss = (diff * diff).mean()
         total = loss if total is None else (total + loss)
@@ -231,9 +272,33 @@ def sam3_weighted_recon_loss(model: LightningModule, batch, batch_idx: int) -> t
     if view in ("gripper", "both") and "rgb_gripper_gt" in cache and "rgb_gripper_recon" in cache:
         gt = cache["rgb_gripper_gt"]
         pred = cache["rgb_gripper_recon"]
-        wm = compute_weight_map_from_lang_text_batch(
-            gt, sam3_processor, conf_thr, lang_text, thresholds, alpha
-        )
+        if precomputed_dir:
+            if idx_field is None:
+                raise KeyError("sam3_precomputed_dir is set, but batch has no 'idx' field")
+            if isinstance(lang_text, str) or lang_text is None:
+                texts = [str(lang_text or "")] * int(gt.shape[0])
+            else:
+                texts = [str(x) for x in list(lang_text)]
+            idxs = idx_field.tolist() if torch.is_tensor(idx_field) else list(idx_field)
+            masks = []
+            for t, j in zip(texts, idxs):
+                key = make_sample_key(t, int(j))
+                m = load_mask_u8(precomputed_dir, view="gripper", key=key, device=gt.device)
+                if m is None:
+                    raise FileNotFoundError(f"Missing precomputed gripper mask for key={key} (idx={j})")
+                masks.append(m)
+            mask_hw = torch.stack(masks, dim=0)  # (B,H,W)
+            wm = mask_hw[:, None, None].expand(gt.shape[0], gt.shape[1], 1, gt.shape[3], gt.shape[4]).to(dtype=gt.dtype)
+        else:
+            wm = compute_weight_map_from_lang_text_batch(
+                gt,
+                sam3_processor,
+                conf_thr,
+                lang_text,
+                thresholds,
+                alpha,
+                max_prompts_per_image=max_prompts_per_image,
+            )
         diff = (pred - gt) * wm
         loss = (diff * diff).mean()
         total = loss if total is None else (total + loss)
@@ -434,9 +499,40 @@ def train(cfg: DictConfig) -> None:
         # Make custom loss cfg available to built-in hooks (e.g., sam3_weighted_recon_loss)
         global _CUSTOM_LOSS_CFG
         _CUSTOM_LOSS_CFG = cfg.custom_loss if "custom_loss" in cfg else None
+        # IMPORTANT: this file is often executed as `__main__`, but the custom loss is loaded via
+        # `importlib.import_module("mode.training_libero_msillm_sam")`, which creates a *second*
+        # module instance with its own globals. Mirror the config into that module if present so
+        # sam3_* options (thresholds/resolution/etc.) actually take effect.
+        try:
+            import sys
+
+            m = sys.modules.get("mode.training_libero_msillm_sam", None)
+            if m is not None:
+                setattr(m, "_CUSTOM_LOSS_CFG", _CUSTOM_LOSS_CFG)
+        except Exception:
+            pass
 
         # Optional: patch training_step to include a user-defined custom loss term
         custom_loss_fn, custom_loss_weight, custom_loss_log_name = _load_custom_loss_hook(cfg)
+        
+        # IMPORTANT: _load_custom_loss_hook imports the loss function's module (often
+        # `mode.training_libero_msillm_sam`) which may be a *different module instance*
+        # than `__main__`. Ensure the imported module sees the same custom-loss config;
+        # otherwise cfg_get(...) inside the loss will fall back to defaults (e.g., fp32).
+        if custom_loss_fn is not None:
+            try:
+                import sys
+                loss_mod = sys.modules.get(getattr(custom_loss_fn, "__module__", ""), None)
+                if loss_mod is not None:
+                    setattr(loss_mod, "_CUSTOM_LOSS_CFG", _CUSTOM_LOSS_CFG)
+            except Exception:
+                pass
+        
+        # Pre-warm SAM3 text encoder cache with all possible prompts from all instructions
+        if custom_loss_fn is not None and custom_loss_weight != 0.0:
+            from mode.training_utils import pre_warm_sam3_text_cache
+            pre_warm_sam3_text_cache(datamodule, _CUSTOM_LOSS_CFG, logger=logger)
+
         if custom_loss_fn is not None and custom_loss_weight != 0.0:
             _patch_training_step_with_custom_loss(
                 model,

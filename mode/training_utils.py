@@ -473,3 +473,124 @@ def cleanup_distributed():
     """Cleanup distributed training resources"""
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def pre_warm_sam3_text_cache(
+    datamodule,
+    custom_loss_cfg: Optional[DictConfig],
+    logger=None,
+) -> bool:
+    """
+    Pre-warm SAM3 text encoder cache with all possible prompts from all LIBERO instructions.
+    
+    Since LIBERO has only 10 fixed instructions, we can tokenize all prompt candidates
+    upfront to avoid any forward_text calls during training (cache hits only).
+    
+    Args:
+        datamodule: LightningDataModule instance (should have benchmark_name attribute for LIBERO)
+        custom_loss_cfg: DictConfig with SAM3 configuration (sam3_resolution, sam3_infer_dtype, etc.)
+        logger: Optional logger for logging messages
+    
+    Returns:
+        True if pre-warming succeeded, False otherwise
+    """
+    if custom_loss_cfg is None:
+        print("[SAM3 pre-warming] Skipping: custom_loss_cfg is None")
+        return False
+    
+    try:
+        from sam.utils.prompts import build_prompt_candidates
+        from sam.utils.sam3_weight_map import get_sam3_processor, _get_text_outputs_cached
+        
+        print("[SAM3 pre-warming] Starting pre-warming process...")
+        if logger is not None:
+            logger.info("[SAM3 pre-warming] Starting pre-warming process...")
+        
+        # Get benchmark name from datamodule (assumes LiberoDataModule structure)
+        benchmark_name = getattr(datamodule, "benchmark_name", None)
+        if not benchmark_name:
+            msg = "[SAM3 pre-warming] Skipping: datamodule has no benchmark_name attribute"
+            print(msg)
+            if logger is not None:
+                logger.info(msg)
+            return False
+        
+        from libero.libero.benchmark import get_benchmark
+        
+        benchmark_instance = get_benchmark(benchmark_name)()
+        num_tasks = benchmark_instance.get_num_tasks()
+        
+        # Collect all unique prompt candidates from all instructions.
+        # We cache ALL possible candidates (no limit) so that training can use any subset
+        # via max_prompts_per_image without cache misses.
+        all_prompt_candidates = set()
+        
+        for i in range(num_tasks):
+            instruction = benchmark_instance.get_task(i).language
+            cands = build_prompt_candidates(instruction or "")
+            if not cands:
+                cands = ["object"]
+            all_prompt_candidates.update(cands)
+        
+        if not all_prompt_candidates:
+            if logger is not None:
+                logger.info("[SAM3 pre-warming] Skipping: no prompt candidates found")
+            return False
+        
+        # Initialize SAM3 processor (same config as used in loss)
+        sam3_resolution = int(cfg_get(custom_loss_cfg, "sam3_resolution", 1008))
+        sam3_infer_dtype = str(cfg_get(custom_loss_cfg, "sam3_infer_dtype", "fp32"))
+        conf_thr = float(cfg_get(custom_loss_cfg, "sam3_confidence_threshold", 0.05))
+        
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        sam3_processor = get_sam3_processor(
+            device=device,
+            logger=logger,
+            resolution=sam3_resolution,
+            infer_dtype=sam3_infer_dtype,
+            confidence_threshold=conf_thr,
+        )
+        
+        # Pre-warm text cache: run forward_text on all unique prompts once
+        prompt_list = sorted(all_prompt_candidates)  # Deterministic order
+        msg1 = f"[SAM3 pre-warming] Pre-tokenizing {len(prompt_list)} unique prompt candidates from {num_tasks} instructions..."
+        msg2 = f"[SAM3 pre-warming] Prompt list (first 10): {prompt_list[:10]}"
+        print(msg1)
+        print(msg2)
+        if logger is not None:
+            logger.info(msg1)
+            logger.info(msg2)
+        
+        _get_text_outputs_cached(sam3_processor.model, prompt_list, device=device)
+        
+        # Verify cache was populated
+        from sam.utils.sam3_weight_map import _TEXT_FEAT_CACHE
+        actual_cache_size = len(_TEXT_FEAT_CACHE)
+        cached_prompts = sorted(_TEXT_FEAT_CACHE.keys())
+        expected_prompts = sorted(prompt_list)
+        
+        msg3 = (
+            f"[SAM3 pre-warming] ✓ Text encoder cache pre-warmed. "
+            f"Cache size: {actual_cache_size} (expected: {len(prompt_list)}). "
+            f"Training forward_text calls should be ~0s (cache hits only)."
+        )
+        print(msg3)
+        if logger is not None:
+            logger.info(msg3)
+            if actual_cache_size != len(prompt_list) or cached_prompts != expected_prompts:
+                msg4 = (
+                    f"[SAM3 pre-warming] Cache mismatch! "
+                    f"Expected {len(prompt_list)} prompts but got {actual_cache_size}. "
+                    f"\n  Expected: {expected_prompts[:10]}{'...' if len(expected_prompts) > 10 else ''}"
+                    f"\n  Cached:   {cached_prompts[:10]}{'...' if len(cached_prompts) > 10 else ''}"
+                )
+                print(f"WARNING: {msg4}")
+                logger.warning(msg4)
+        return True
+        
+    except Exception as e:
+        if logger is not None:
+            logger.warning(f"[SAM3 pre-warming] Failed to pre-warm text cache: {type(e).__name__}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        return False
