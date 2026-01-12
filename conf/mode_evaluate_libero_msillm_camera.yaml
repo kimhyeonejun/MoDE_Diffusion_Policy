@@ -1,0 +1,74 @@
+defaults:
+  - datamodule: libero
+  - model: mode_agent
+  - _self_
+
+eval_cfg_overwrite:
+  model:
+    num_sampling_steps: 10
+  msillm:
+    hub_repo: facebookresearch/NeuralCompression:main
+    entrypoint: msillm_quality_1  # Default MS-ILLM quality variant (can be overridden via CLI: eval_cfg_overwrite.msillm.entrypoint=msillm_quality_2, etc.)
+    pretrained: true
+
+# Dual MS-ILLM configuration: use different checkpoints for each camera
+# If both msillm_static and msillm_gripper are specified, they will be used instead of the single msillm config above
+# You can specify either:
+#   - checkpoint: path to .ckpt file (e.g., "path/to/msillm_static.ckpt")
+#   - entrypoint: torchhub entrypoint name (e.g., "msillm_quality_1")
+msillm_static:
+  # Option 1: Load from .ckpt checkpoint file
+  checkpoint: /home/hjkim/MoDE_Diffusion_Policy/saved_models/msillm-NeuralCompression_main-msillm_quality_1_epoch=00.ckpt  # e.g., "/path/to/msillm_static.ckpt"
+  
+  # Option 2: Load from torchhub (used if checkpoint is null)
+  hub_repo: facebookresearch/NeuralCompression:main
+  entrypoint: msillm_quality_1  # MS-ILLM checkpoint for rgb_static camera
+  pretrained: true
+
+msillm_gripper:
+  # Option 1: Load from .ckpt checkpoint file
+  checkpoint: /home/hjkim/MoDE_Diffusion_Policy/saved_models/msillm-NeuralCompression_main-msillm_quality_vlo2_gripper_only_epoch=07.ckpt  # e.g., "/path/to/msillm_gripper.ckpt"
+  
+  # Option 2: Load from torchhub (used if checkpoint is null)
+  hub_repo: facebookresearch/NeuralCompression:main
+  entrypoint: msillm_quality_1  # MS-ILLM checkpoint for rgb_gripper camera
+  pretrained: true
+
+train_folder: /home/khj20343/MoDE_Diffusion_Policy/saved_models
+checkpoint: null  # Set to null to use pretrain_chk from config_libero_msillm.yaml, or specify checkpoint path/Hugging Face repo ID
+device: 0
+use_ema_weights: true  # Set to true to use EMA weights instead of regular weights (if available in checkpoint)
+
+# Base output directory for evaluation artifacts (videos, results.json, wandb dir, etc.)
+# With the current `get_log_dir()` logic, outputs will be saved under:
+#   ${log_dir}/<checkpoint_relative_path_without_suffix>/
+log_dir: outputs/eval
+dataset_path: /tmp
+num_videos: 1
+use_reconstructed_video: true  # If true, save MS-ILLM reconstructed images to video; if false, save original env images
+debug: False
+
+log_wandb: True
+wandb_entity: ${oc.env:WANDB_ENTITY,null}
+
+
+num_sampling_steps: null
+sampler_type: null
+multistep: null
+sigma_min: null
+sigma_max: null
+noise_scheduler: null
+
+num_sequences: 50
+max_steps: 520
+n_eval: 50
+task_embedding_format: clip
+
+benchmark_name: libero_10 # [LIBERO_SPATIAL, LIBERO_OBJECT, LIBERO_GOAL, LIBERO_90, LIBERO_10]
+
+hydra:
+  run:
+    dir: outputs/eval  # Directory will be updated in code based on checkpoint
+  job:
+    name: "libero_msillm_eval"  # Default job name (will be updated if checkpoint is provided)
+
