@@ -22,7 +22,7 @@ use_ema_weights: true  # Set to true to use EMA weights instead of regular weigh
 log_dir: single_camera
 dataset_path: /tmp
 num_videos: 1
-use_reconstructed_video: false  # If true, save MS-ILLM reconstructed images to video; if false, save original env images
+use_reconstructed_video: true  # If true, save MS-ILLM reconstructed images to video; if false, save original env images
 debug: False
 
 log_wandb: True

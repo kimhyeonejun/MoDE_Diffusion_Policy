@@ -120,7 +120,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
         # encoder -> hyper_analysis -> hyper_bottleneck -> hyper_synthesis -> latent_bottleneck -> decoder
         # All steps except decoder should be no_grad to ensure only decoder trains
         # IMPORTANT: Explicitly delete intermediate tensors to save memory (especially when compress_gripper=True)
-        #with torch.no_grad():
+        with torch.no_grad():
             # Step 1: Encode image to latent (same as msillm.forward line 498)
             latent = encoder(x01_bt_resized)
             # Delete input after encoding to free memory
