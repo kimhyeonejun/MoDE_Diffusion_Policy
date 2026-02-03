@@ -171,7 +171,7 @@ def patch_modeagent_embed_visual_obs_for_msillm(model: LightningModule, compress
         # Apply MS-ILLM reconstruction so decoder gradients flow.
         # Only reconstruct rgb_static if configured
         if compress_rgb:
-        rgb_static = _reconstruct_normed(rgb_static)
+            rgb_static = _reconstruct_normed(rgb_static)
         else:
             # Normalize static image even when not compressing (inputs are in [0, 1] range)
             mean, std = clip_mean_std(rgb_static.device, rgb_static.dtype)
